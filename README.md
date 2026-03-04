@@ -2,7 +2,7 @@
 
 Este script está pensado para correr campañas reproducibles de docking peptídico con AGFR + ADCP dentro de una estructura de experimento con raíz (exp_root) y condiciones organizadas por proteína y péptido.
 
-Estructura de directorios (Mode B, recomendado)
+Estructura de directorios (Mode B, recomendado) 
 La convención central es:
 
 <exp_root>/
@@ -278,6 +278,259 @@ find replicas -path "*/results/*_out.pdb" -print
 
 find replicas -path "*/results/*_summary.dlg" -print
 
+
+Análisis reproducible de réplicas ADCP + OpenMM para docking de péptidos
+Este paquete/script (anal_adcp_agfr_replicas_campaign) analiza resultados de docking de péptidos producidos con AutoDock CrankPep (ADCP) y re‐ranking por minimización con OpenMM (con solvente implícito y score de interacción -reint). Su objetivo principal es transformar un conjunto de réplicas dispersas en disco en:
+Tablas consolidadas (CSV) con métricas por réplica y por grupo (proteína–péptido)
+Métricas de discriminación entre péptidos (p.ej. POI vs controles) con significancia estadística
+Exports de poses para inspección estructural (winners y top-k concatenado)
+El enfoque es de generación de hipótesis / priorización, no un estimador concluyente de afinidad o especificidad. El score de OpenMM se usa como criterio relativo bajo un protocolo constante para POI y controles, y se complementa con señales de convergencia estructural (clusterización por contactos).
+
+1. Filosofía y supuestos
+1.1 Qué se intenta medir
+El pipeline busca evidencia del tipo:
+“Para esta proteína, el POI converge repetidamente a un sitio/modo de contacto dominante y los controles no.”
+“Para esta proteína, el POI tiende a puntuar mejor (más negativo) que el fondo de controles bajo el mismo protocolo.”
+“En esta proteína, todos los péptidos se comportan igual → no hay señal discriminante.”
+1.2 Qué NO se debe concluir
+El score de OpenMM tras minimización NO es energía libre de unión (ΔG).
+Un score más negativo no prueba afinidad específica por sí solo.
+La minimización puede introducir artefactos si se interpreta como termodinámica real.
+Por eso, anal_adcp_agfr_replicas_campaign reporta:
+distribuciones (medianas/IQR, no “best run”),
+tamaños de efecto y pruebas estadísticas,
+convergencia y “modo dominante”.
+
+2. Estructura esperada del experimento en disco
+anal_adcp_agfr_replicas_campaign está diseñado para recorrer un experimento con estructura tipo:
+exp001/
+ analysis/                    (salidas de anal_adcp_agfr_replicas_campaign; puede existir o crearse)
+ runs/
+   P001/
+     POI/
+       replicas/replica_001/results/*_summary.dlg
+       replicas/replica_001/results/*_omm_rescored_out.pdb   (si existe)
+       replicas/replica_001/docking/work/*_out.pdb           (opcional)
+       ...
+     polya/
+     random001/
+     scramble001/
+     decoy001/
+     x12/
+   P002/
+   ...
+2.1 Auto-discovery
+El script no requiere que existan resultados en todas las carpetas. Recorre todo lo que haya bajo runs/ y:
+procesa lo que encuentre (réplicas con *_summary.dlg)
+emite warnings resumidos por grupo vacío o incompleto
+continúa sin interrumpirse
+2.2 Archivos clave por réplica (fuentes de verdad)
+Para una carpeta .../replica_XXX/, los archivos relevantes son:
+Canónico: results/*_summary.dlg
+Contiene:
+tabla de clusters ADCP
+energías OpenMM por modelo minimizado
+tabla final OMM Ranking (re-ranking por interacción)
+Opcional: results/*_omm_rescored_out.pdb
+PDB multi-modelo reordenado por ranking OpenMM (modelo 1 = rank 1), con USER: incluyendo dE_Interaction.
+Opcional: docking/work/*_out.pdb
+PDB con modelos ADCP pre-minimización, USER: SCORE ... por modelo.
+Si un archivo no existe, anal_adcp_agfr_replicas_campaign utiliza lo disponible y marca QA.
+
+3. Cómo se define el “winner” por réplica
+Cada réplica produce varios modelos (poses). anal_adcp_agfr_replicas_campaign define:
+Winner post-OpenMM = la fila con RankOpenMM = 1 en la tabla OMM Ranking del *_summary.dlg.
+Este winner corresponde, cuando existe *_omm_rescored_out.pdb, a MODEL 1 (porque el PDB está reordenado por el ranking).
+3.1 Score principal por réplica
+El score primario para análisis es:
+winner_omm_dE_interaction
+que corresponde a:
+dE_Interaction reportado por OpenMM, equivalente a
+E_complex − E_receptor − E_peptide
+bajo solvente implícito (según el protocolo).
+Interpretación:
+más negativo → interacción más favorable según este criterio de minimización
+se usa comparativamente (POI vs controles) y con réplicas
+
+4. Identificación de clusters y convergencia (definición B)
+ADCP reporta una tabla de clusters “mode | affinity | clust size | best run …”.
+El OMM Ranking reporta best run asociado al modelo. Para asignar un identificador de cluster al winner:
+Definición B (adoptada):
+winner_best_run_pose_id se toma del renglón winner en OMM Ranking.
+Se busca en la tabla de clusters ADCP el mode cuyo best run coincide.
+Ese mode se guarda como winner_cluster_mode_id.
+Esto permite calcular convergencia por grupo (proteína–péptido) usando la distribución de winner_cluster_mode_id en las réplicas.
+
+5. Archivos de salida (en analysis/)
+anal_adcp_agfr_replicas_campaign produce varias tablas CSV y archivos auxiliares.
+5.1 replicas_parsed.csv (tabla principal por réplica)
+Una fila = 1 réplica (winner OpenMM)
+Campos típicos (pueden variar ligeramente si faltan archivos):
+IDs: experiment_id, protein_id, peptide_id, replica_id
+Trazabilidad: summary_path, rescored_pdb_path, out_pdb_path
+Parámetros: sequence, N_runs, n_evals, nmin, env, nitr
+ADCP: adcp_bestEnergy, adcp_bestEnergy_run
+Winner:
+winner_omm_dE_interaction (score principal)
+winner_omm_dE_complex_minus_receptor (auxiliar)
+winner_adcp_affinity
+winner_rank_adcp
+winner_cluster_size
+winner_best_run_pose_id
+winner_cluster_mode_id (por definición B)
+QA: qa_status, qa_message
+Cómo usarla:
+Para comparar POI vs control: filtrar por protein_id y peptide_id, graficar la distribución de winner_omm_dE_interaction.
+Para convergencia: contar frecuencia de winner_cluster_mode_id.
+
+5.2 topk_parsed.csv (top-k re-rankeado por réplica)
+Una fila = 1 modelo (pose) dentro del top-k (nmin)
+Incluye para cada réplica y rank_openmm=1..k:
+omm_dE_interaction, adcp_affinity, cluster_size, best_run_pose_id, cluster_mode_id, etc.
+Cómo usarla:
+Ver si el POI mantiene ventaja en top-3, no solo en top-1.
+QA de reordenamiento: ver diferencias entre rank_openmm y rank_adcp.
+
+5.3 clusters_parsed.csv (tabla de clusters ADCP por réplica)
+Una fila = 1 cluster mode (1..10) por réplica
+mode, adcp_affinity, cluster_size, best_run_pose_id
+Cómo usarla:
+Diagnóstico de landscape: ¿hay un modo dominante grande o muchos modos pequeños?
+Comparar “estructura del clustering” entre péptidos.
+
+5.4 group_summary.csv (resumen por proteína–péptido)
+Una fila = 1 grupo (protein_id, peptide_id)
+Se calcula usando replicas_parsed.csv con qa_status == OK.
+Incluye:
+Tamaños
+n_replicas_total, n_ok, fail_rate
+Energía (score principal)
+Eint_median, Eint_IQR (y opcionales mean/sd/MAD)
+Convergencia
+cluster_mode_top
+cluster_mode_top_freq (= f1_cluster)
+cluster_mode_entropy
+cluster_mode_Neff (= exp(entropy))
+n_unique_modes
+Diagnósticos auxiliares
+winner_cluster_size_median, winner_cluster_size_IQR
+Cómo usarla:
+Comparar rápidamente POI vs polya en una proteína:
+si POI tiene Eint_median más favorable y
+cluster_mode_top_freq más alto / Neff más bajo → señal de convergencia.
+
+5.5 discrimination.csv (comparación entre péptidos dentro de proteína)
+Una fila = 1 comparación (A vs B) dentro de una proteína
+Usa los winner_omm_dE_interaction de cada grupo:
+wins_A_over_B (proporción de pares con A “mejor”)
+AUC (equivalente a Mann–Whitney U normalizado)
+cliffs_delta (= 2*AUC − 1)
+p_mannwhitney
+p_permutation (si se activa)
+p_adj_fdr (cuando hay múltiples comparaciones)
+convergencia: f1_A, f1_B, Neff_A, Neff_B, delta_*
+verdict (diagnóstico automático)
+Cómo interpretar:
+AUC ~ 0.5 → sin discriminación
+AUC → 1.0 → A casi siempre mejor que B
+cliffs_delta magnitud del efecto (regla práctica):
+|δ| < 0.147: pequeño
+0.147–0.33: pequeño–medio
+0.33–0.474: medio
+0.474: grande
+
+6. Exports de poses (PDB)
+6.1 Winners por réplica
+Directorio:
+analysis/poses_winners/<protein_id>/<peptide_id>/
+Se exporta 1 PDB por réplica (winner), típicamente:
+desde *_omm_rescored_out.pdb → MODEL 1
+si falta, anal_adcp_agfr_replicas_campaign puede omitir el export y reportarlo en QA.
+Uso:
+inspección visual rápida de convergencia de sitio y geometría.
+6.2 Top-k concatenado (todas las réplicas)
+Directorio:
+analysis/poses_topk_concat/<protein_id>/<peptide_id>/
+Archivos:
+topk_concat.pdb (por grupo proteína–péptido)
+Contiene:
+si hay 30 réplicas y k=5 → hasta 150 modelos.
+Orden recomendado:
+réplica_001 rank1..rank5
+réplica_002 rank1..rank5
+...
+Cada MODEL incluye encabezado USER: con energías, para rastreabilidad.
+Uso:
+generar mapas de contactos, clustering externo, o scripts de visualización que recorran modelos.
+
+7. Filtro de sanity para energías
+anal_adcp_agfr_replicas_campaign puede marcar (no necesariamente descartar) réplicas con:
+winner_omm_dE_interaction NaN / no parseable
+valores fuera de un rango razonable (umbral configurable)
+Objetivo:
+evitar que 1–2 outliers numéricos arruinen pruebas o mediana/IQR.
+mantener trazabilidad (réplica se marca como QA fail con mensaje).
+
+8. Ejecución
+8.1 CLI
+Ejemplo:
+anal_adcp_agfr_replicas_campaign --exp-root exp001 --outdir analysis
+Donde:
+--exp-root apunta al directorio del experimento (contiene runs/)
+--outdir es donde escribir outputs (por convenio analysis/)
+8.2 Comportamiento con datos incompletos
+Si existen carpetas random001/ etc. sin réplicas parseables:
+anal_adcp_agfr_replicas_campaign no falla
+reporta algo como:
+runs/P001/random001: 0 replicas parsed (no summary.dlg found)
+y continúa.
+
+9. Flujo recomendado de uso e interpretación
+Correr anal_adcp_agfr_replicas_campaign tras obtener réplicas para POI y un control (p.ej. polya).
+Ver analysis/parse_report.* para asegurar:
+n_ok ~ número esperado de réplicas
+fail_rate bajo
+Revisar group_summary.csv:
+comparar Eint_median y Neff/f1 entre POI y control
+Revisar discrimination.csv:
+AUC, Cliff’s delta y p-values
+Si hay señal:
+escalar a más controles (scramble/random/decoys matched)
+y a más proteínas
+Si no hay señal:
+revisar QA
+revisar distribución top-k
+inspeccionar poses winners/topk_concat para detectar “pegajosidad” o sitios triviales
+
+10. Notas prácticas y advertencias
+Comparaciones entre proteínas distintas deben hacerse con cuidado: las energías de interacción de OpenMM pueden tener offsets dependientes del sistema.
+Lo más defendible es comparar dentro de la misma proteína: POI vs controles.
+La convergencia por cluster_mode_id depende del clustering interno de ADCP (cutoff, etc.).
+Aun así, el contraste POI vs controles bajo el mismo protocolo es informativo.
+El pipeline es útil como priorización: para decidir qué proteínas/peptidos merecen rescoring más caro (MM/GBSA, MD corta, etc.) o validación experimental.
+
+11. Archivos auxiliares (recomendados)
+Además de los CSV, anal_adcp_agfr_replicas_campaign genera:
+analysis/parse_report.txt o .json
+Resumen de grupos encontrados, réplicas OK/fallidas y causas.
+analysis/run_info.json
+Versiones, fecha, argumentos CLI, y parámetros de análisis (k, umbrales QA, etc.).
+
+12. Preguntas frecuentes
+¿Qué métrica debo usar para “ranking” final?
+Para ranking dentro de una proteína, use una combinación de:
+Eint_median (más negativo mejor)
+cluster_mode_top_freq alto / Neff bajo (convergencia)
+estabilidad (IQR no enorme, fail_rate bajo)
+¿Qué pasa si polya “gana” en energía?
+Eso puede indicar un régimen de pegajosidad hidrofóbica. No se oculta: se reporta. En ese caso:
+los decoys matched se vuelven aún más importantes,
+y conviene revisar si el box/entorno favorece superficies hidrofóbicas no específicas.
+¿Por qué AUC/Mann–Whitney y no t-test?
+Porque:
+no asumimos normalidad
+el criterio es ordinal (“¿A suele ser mejor que B?”)
+es más robusto para distribuciones sesgadas o con colas.
 
 
 
