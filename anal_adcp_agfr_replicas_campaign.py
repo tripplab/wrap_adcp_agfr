@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-dockanalrep.py
+anal_adcp_agfr_replicas_campaign.py
 
 Parser + consolidación + export PDB + QA para réplicas ADCP + OpenMM (re-ranking -reint).
 
 Invocación sugerida:
-  python dockanalrep.py --exp-root exp001 --outdir analysis
+  python anal_adcp_agfr_replicas_campaign.py --exp-root exp001 --outdir analysis
 
-(Después, si deseas, puedes instalarlo como comando `dockanalrep` con un entry-point.)
+(Después, si deseas, puedes instalarlo como comando `anal_adcp_agfr_replicas_campaign` con un entry-point.)
 """
 
 from __future__ import annotations
@@ -910,7 +910,7 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
 
     # Human-readable short report
     lines: List[str] = []
-    lines.append(f"dockanalrep parse report @ {report['timestamp']}")
+    lines.append(f"anal_adcp_agfr_replicas_campaign parse report @ {report['timestamp']}")
     lines.append(f"exp_root: {report['exp_root']}")
     lines.append(f"outdir:   {report['outdir']}")
     lines.append(f"replicas discovered: {report['replicas_total_discovered']}")
@@ -938,7 +938,7 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="dockanalrep",
+        prog="anal_adcp_agfr_replicas_campaign",
         description="Parse + consolidate ADCP/OpenMM replica outputs; export PDB; QA.",
     )
     p.add_argument("--exp-root", required=True, help="Experiment root directory (contains runs/).")
