@@ -218,6 +218,234 @@ python3 pepctrl.py --poi ACDEFGHIKLMNPQRSTVWY --type random --n 30 --format fast
 
 
 
+
+
+
+
+
+
+# tools_generate_run_manifests
+
+Author: trippm@tripplab.com [Feb 2026]
+---
+
+
+
+## ¿Qué hace este script?
+
+`tools_generate_run_manifests.py` automatiza la **preparación de campañas** para experimentos de docking peptídico. Toma como base:
+
+- un listado de proteínas (`proteins.csv`),
+- un listado de péptidos (`peptides.csv`),
+- y una configuración global del experimento (`experiment_manifest.json`).
+
+Con esos insumos, genera para **cada combinación proteína × péptido**:
+
+1. la estructura de carpetas del run,
+2. un `run_manifest.json` por condición/campaña,
+3. una matriz resumen global en `analysis/campaigns_matrix.csv`.
+
+En términos prácticos, crea el “esqueleto” operativo de todas las campañas planeadas.
+
+---
+
+## Entradas (inputs)
+
+El script trabaja sobre el directorio actual (`.`) y espera estos archivos:
+
+- `proteins.csv`
+- `peptides.csv`
+- `experiment_manifest.json`
+
+Si falta alguno, termina con error (`Missing <archivo>`).
+
+### 1) `proteins.csv`
+
+Columnas usadas:
+
+- **Requeridas**:
+  - `protein_id`
+  - `receptor_pdb_file`
+- **Opcionales**:
+  - `protein_name`
+  - `protein_pdb`
+
+### 2) `peptides.csv`
+
+Columnas usadas:
+
+- **Requeridas**:
+  - `peptide_id`
+  - `peptide_seq`
+- **Opcional**:
+  - `peptide_set`
+
+### 3) `experiment_manifest.json`
+
+Claves usadas por el script:
+
+- `experiment_id` (default: `"expXXX"`)
+- `layout_version` (default: `"1.0"`)
+- `engine` (default: `"ADCP+OpenMM"`)
+- `directory_layout` (default: `{}`)
+- `inputs_dir` (default: `"inputs"`)
+- `defaults` (objeto con parámetros por defecto de ejecución)
+- `planned_count_default` (réplicas planificadas por campaña)
+
+Si `planned_count_default` no está definido, el script usa **30** como fallback.
+
+---
+
+## Lógica de generación
+
+1. Lee `proteins.csv` y `peptides.csv` como listas de diccionarios.
+2. Lee y parsea `experiment_manifest.json`.
+3. Calcula `receptors_dir = <inputs_dir>/receptors`.
+4. Recorre todas las combinaciones proteína × péptido (producto cartesiano).
+5. Para cada combinación:
+   - crea el directorio `runs/<protein_id>/<peptide_id>/`,
+   - crea subdirectorios estándar:
+     - `targets/`
+     - `replicas/`
+     - `results/`
+     - `results_parsed/`
+     - `logs/`
+   - define `target_trg` como `targets/receptor.trg`,
+   - escribe `run_manifest.json` dentro del run,
+   - agrega una fila a la matriz de campañas.
+6. Al final, escribe `analysis/campaigns_matrix.csv`.
+
+---
+
+## Salidas (outputs)
+
+### A) Estructura de directorios por campaña
+
+Para cada combinación `<protein_id>/<peptide_id>`:
+
+```text
+runs/
+  <protein_id>/
+    <peptide_id>/
+      run_manifest.json
+      targets/
+      replicas/
+      results/
+      results_parsed/
+      logs/
+```
+
+### B) `run_manifest.json` por campaña
+
+Ruta:
+
+- `runs/<protein_id>/<peptide_id>/run_manifest.json`
+
+Contenido principal:
+
+- Metadatos del experimento (`experiment_id`, `layout_version`, `created_at`, `engine`)
+- Bloque `campaign`:
+  - `campaign_id = <experiment_id>_<protein_id>_<peptide_id>`
+  - IDs y nombres de proteína/péptido
+- Bloque `inputs`:
+  - `receptor_pdb_file`
+  - `receptor_pdb_path` (ej. `inputs/receptors/<archivo>`)
+  - `peptide_seq`
+- Bloque `targets`:
+  - `target_trg`
+  - `target_trg_mode = "per_condition"`
+- Bloque `config`:
+  - parámetros copiados desde `defaults` (ADCP/OpenMM/rerank/cluster)
+- Bloque `replicas`:
+  - `planned_count`
+  - `index_start = 1`
+  - `suffix_width = 3`
+- Bloque `paths`:
+  - rutas del run y subdirectorios
+- `status = "planned"`
+
+### C) Matriz global de campañas
+
+Ruta:
+
+- `analysis/campaigns_matrix.csv`
+
+Columnas:
+
+- `campaign_id`
+- `protein_id`
+- `protein_name`
+- `protein_pdb`
+- `peptide_id`
+- `peptide_set`
+- `peptide_seq`
+- `receptor_pdb_file`
+- `receptor_pdb_path`
+- `run_dir`
+- `target_trg`
+- `planned_replicas`
+
+### D) Mensajes por consola
+
+Al finalizar imprime:
+
+- número de campañas creadas,
+- ruta de la matriz global,
+- ruta de ejemplo de un `run_manifest.json`.
+
+---
+
+## Uso
+
+Desde la raíz del experimento (donde existen los 3 archivos de entrada):
+
+```bash
+python3 tools_generate_run_manifests.py
+```
+
+No recibe argumentos de línea de comandos; opera con rutas fijas relativas al directorio actual.
+
+---
+
+## Consideraciones y edge cases
+
+- El número total de campañas es: `N_proteínas × N_péptidos`.
+- `receptor_pdb_path` se construye como ruta lógica; el script **no valida** que el archivo exista físicamente.
+- Si `planned_count_default` es un string numérico, se guarda como entero en el manifiesto.
+- Si no hay filas en los CSV, podría fallar al imprimir el ejemplo `rows[0]` al final.
+
+---
+
+## Ejemplo de ejecución mínima
+
+```bash
+python3 tools_generate_run_manifests.py
+```
+
+Salida esperada (similar):
+
+```text
+[ok] Created 120 campaigns.
+[ok] Wrote campaign matrix: analysis/campaigns_matrix.csv
+[ok] Example run_manifest: runs/P001/POI/run_manifest.json
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # run_adcp_agfr_replicas_campaign
 
 Author: trippm@tripplab.com [Feb 2026]
