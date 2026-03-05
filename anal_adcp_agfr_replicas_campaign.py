@@ -538,6 +538,36 @@ def renumber_models(blocks: List[str], start_at: int = 1) -> str:
     return "".join(out_lines)
 
 
+def split_model_target_and_pose(block: str) -> Tuple[List[str], List[str]]:
+    """
+    Split MODEL block body lines into target-protein and pose sections.
+
+    Heuristic:
+      - Prefer the LAST TER record as boundary:
+          target = lines up to (and including) that TER
+          pose   = lines after that TER
+      - If no TER is present, leave target empty and mark whole model as pose.
+    """
+    lines = block.splitlines(True)
+    if not lines:
+        return [], []
+
+    # MODEL ... ENDMDL excluded from split payload.
+    body = lines[1:]
+    if body and body[-1].startswith("ENDMDL"):
+        body = body[:-1]
+
+    ter_idx = -1
+    for i, ln in enumerate(body):
+        if ln.startswith("TER"):
+            ter_idx = i
+
+    if ter_idx >= 0:
+        return body[:ter_idx + 1], body[ter_idx + 1:]
+
+    return [], body
+
+
 # ----------------------------
 # Sanity filter
 # ----------------------------
@@ -609,6 +639,9 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
 
     # To build concatenated topk pdb per group
     group_to_concat_blocks: Dict[Tuple[str, str, str], List[str]] = {}
+    group_to_pose_only_blocks: Dict[Tuple[str, str, str], List[str]] = {}
+    group_to_first_target_lines: Dict[Tuple[str, str, str], List[str]] = {}
+    group_to_deint_values: Dict[Tuple[str, str, str], List[float]] = {}
 
     # For summary group-level later (placeholder)
     parsed_replicas: List[ParsedReplica] = []
@@ -700,9 +733,38 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
         # Accumulate concat top-k blocks per group (if rescored exists)
         if rp.rescored_pdb_path and rp.rescored_pdb_path.exists():
             try:
-                blocks = extract_first_k_models(rp.rescored_pdb_path, topk_k)
-                if blocks:
-                    group_to_concat_blocks.setdefault(key.group_key(), []).extend(blocks)
+                model_entries: List[Tuple[int, str]] = []
+                for idx, (mid, block) in enumerate(iter_pdb_models(read_text(rp.rescored_pdb_path)), start=1):
+                    model_entries.append((mid, block))
+                    if idx >= topk_k:
+                        break
+
+                if model_entries:
+                    blocks = [block for _, block in model_entries]
+                    gk = key.group_key()
+                    group_to_concat_blocks.setdefault(gk, []).extend(blocks)
+
+                    model_to_deint = {r.model_id: r.omm_dE_interaction for r in topk}
+                    for mid, _ in model_entries:
+                        if mid in model_to_deint:
+                            group_to_deint_values.setdefault(gk, []).append(model_to_deint[mid])
+                        else:
+                            qa_msgs.append(f"No dE_Interaction found for MODEL {mid} in top-k table.")
+
+                    pose_blocks: List[str] = []
+                    for i, block in enumerate(blocks):
+                        target_lines, pose_lines = split_model_target_and_pose(block)
+                        if i == 0 and gk not in group_to_first_target_lines and target_lines:
+                            group_to_first_target_lines[gk] = target_lines
+
+                        if pose_lines:
+                            pose_block = f"MODEL        1\n{''.join(pose_lines)}ENDMDL\n"
+                            pose_blocks.append(pose_block)
+
+                    if pose_blocks:
+                        group_to_pose_only_blocks.setdefault(gk, []).extend(pose_blocks)
+                    else:
+                        qa_msgs.append("Could not split target/pose for pose-only concat export.")
                 else:
                     qa_msgs.append("No MODEL blocks found for concat export.")
             except Exception as ex:
@@ -836,6 +898,29 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
         out_path = concat_dir / protein_id / peptide_id / f"topk_concat_{protein_id}_{peptide_id}.pdb"
         safe_mkdir(out_path.parent)
         write_text(out_path, concat_text)
+
+        pose_only_path = ""
+        pose_blocks = group_to_pose_only_blocks.get(gk, [])
+        if pose_blocks:
+            pose_text = renumber_models(pose_blocks, start_at=1)
+            pose_out_path = concat_dir / protein_id / peptide_id / f"topk_concat_poses_{protein_id}_{peptide_id}.pdb"
+            write_text(pose_out_path, pose_text)
+            pose_only_path = str(pose_out_path)
+
+        first_target_path = ""
+        first_target_lines = group_to_first_target_lines.get(gk, [])
+        if first_target_lines:
+            target_out_path = concat_dir / protein_id / peptide_id / f"topk_first_target_{protein_id}_{peptide_id}.pdb"
+            write_text(target_out_path, "".join(first_target_lines))
+            first_target_path = str(target_out_path)
+
+        deint_path = ""
+        deint_values = group_to_deint_values.get(gk, [])
+        if deint_values:
+            deint_out_path = concat_dir / protein_id / peptide_id / f"topk_omm_dEinter_{protein_id}_{peptide_id}.dat"
+            write_text(deint_out_path, "\n".join(str(v) for v in deint_values) + "\n")
+            deint_path = str(deint_out_path)
+
         concat_index_rows.append({
             "experiment_id": exp_id,
             "protein_id": protein_id,
@@ -843,9 +928,15 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
             "k_per_replica": topk_k,
             "n_models_total": len(blocks),
             "concat_pdb_path": str(out_path),
+            "concat_pose_only_pdb_path": pose_only_path,
+            "first_target_pdb_path": first_target_path,
+            "deinter_dat_path": deint_path,
         })
     write_csv(outdir / "topk_concat_index.csv", concat_index_rows,
-              ["experiment_id", "protein_id", "peptide_id", "k_per_replica", "n_models_total", "concat_pdb_path"])
+              [
+                  "experiment_id", "protein_id", "peptide_id", "k_per_replica", "n_models_total",
+                  "concat_pdb_path", "concat_pose_only_pdb_path", "first_target_pdb_path", "deinter_dat_path",
+              ])
 
     # ----------------------------
     # PHASE 2 (placeholder): Esquema de tablas -> métricas -> tests -> reporte
