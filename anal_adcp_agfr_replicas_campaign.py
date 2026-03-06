@@ -598,6 +598,42 @@ def split_model_target_and_pose(block: str) -> Tuple[List[str], List[str], str]:
     return [], body, "unsplit"
 
 
+def extract_unrestrained_receptor_residues(target_lines: List[str]) -> List[Tuple[str, str, int]]:
+    """
+    Parse residues listed after:
+      USER: RECEPTOR RESIDUES NOT RESTRAINED DURING MINIMIZATION:
+
+    Expected token pattern inside USER lines: _<CHAIN>_<RESNAME>_<RESNUM>
+    e.g. _A_ALA_52
+    """
+    capture = False
+    chunks: List[str] = []
+    for ln in target_lines:
+        if not ln.startswith("USER"):
+            continue
+
+        payload = ln[4:].strip()
+        if "RECEPTOR RESIDUES NOT RESTRAINED DURING MINIMIZATION:" in payload:
+            capture = True
+            _, _, suffix = payload.partition("RECEPTOR RESIDUES NOT RESTRAINED DURING MINIMIZATION:")
+            if suffix:
+                chunks.append(suffix)
+            continue
+
+        if capture:
+            chunks.append(payload)
+
+    text = " ".join(chunks)
+    out: List[Tuple[str, str, int]] = []
+    for m in re.finditer(r"_([A-Za-z0-9])_([A-Za-z]{3})_(-?\d+)", text):
+        out.append((m.group(1), m.group(2).upper(), int(m.group(3))))
+    return out
+
+
+def format_unrestrained_receptor_residues_dat(residues: List[Tuple[str, str, int]]) -> str:
+    return "\n".join(f"Chain  {chain}  {resname:>3}    {resnum}" for chain, resname, resnum in residues) + "\n"
+
+
 # ----------------------------
 # Sanity filter
 # ----------------------------
@@ -673,6 +709,7 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
     group_to_concat_blocks: Dict[Tuple[str, str, str], List[str]] = {}
     group_to_pose_only_blocks: Dict[Tuple[str, str, str], List[str]] = {}
     group_to_first_target_lines: Dict[Tuple[str, str, str], List[str]] = {}
+    group_to_ppi_unrestrained_residues: Dict[Tuple[str, str, str], List[Tuple[str, str, int]]] = {}
     group_to_deint_values: Dict[Tuple[str, str, str], List[float]] = {}
     split_strategy_counts: Dict[str, int] = {
         "first_ter": 0,
@@ -799,6 +836,9 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
                         split_strategy_counts[split_strategy] = split_strategy_counts.get(split_strategy, 0) + 1
                         if i == 0 and gk not in group_to_first_target_lines and target_lines:
                             group_to_first_target_lines[gk] = target_lines
+                            residues = extract_unrestrained_receptor_residues(target_lines)
+                            if residues:
+                                group_to_ppi_unrestrained_residues[gk] = residues
 
                         if split_strategy == "chain_fallback":
                             qa_msgs.append("Target/pose split used chain-based fallback (no TER found).")
@@ -968,6 +1008,13 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
             write_text(target_out_path, "".join(first_target_lines))
             first_target_path = str(target_out_path)
 
+        ppi_unrestrained_path = ""
+        ppi_residues = group_to_ppi_unrestrained_residues.get(gk, [])
+        if ppi_residues:
+            ppi_out_path = concat_dir / protein_id / peptide_id / f"topk_first_target_PPI_{protein_id}_{peptide_id}.dat"
+            write_text(ppi_out_path, format_unrestrained_receptor_residues_dat(ppi_residues))
+            ppi_unrestrained_path = str(ppi_out_path)
+
         deint_path = ""
         deint_values = group_to_deint_values.get(gk, [])
         if deint_values:
@@ -984,12 +1031,13 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
             "concat_pdb_path": str(out_path),
             "concat_pose_only_pdb_path": pose_only_path,
             "first_target_pdb_path": first_target_path,
+            "first_target_ppi_dat_path": ppi_unrestrained_path,
             "deinter_dat_path": deint_path,
         })
     write_csv(outdir / "topk_concat_index.csv", concat_index_rows,
               [
                   "experiment_id", "protein_id", "peptide_id", "k_per_replica", "n_models_total",
-                  "concat_pdb_path", "concat_pose_only_pdb_path", "first_target_pdb_path", "deinter_dat_path",
+                  "concat_pdb_path", "concat_pose_only_pdb_path", "first_target_pdb_path", "first_target_ppi_dat_path", "deinter_dat_path",
               ])
     vlog(1, verbose, f"[INFO] Wrote {outdir / 'topk_concat_index.csv'} ({len(concat_index_rows)} groups)")
     print(
