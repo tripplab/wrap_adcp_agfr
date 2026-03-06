@@ -34,6 +34,11 @@ def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
 
+def vlog(level: int, verbose: int, msg: str) -> None:
+    if verbose >= level:
+        eprint(msg)
+
+
 def safe_mkdir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
@@ -607,10 +612,12 @@ def write_csv(path: Path, rows: List[Dict[str, object]], fieldnames: List[str]) 
 # Pipeline principal: parseo + consolidación + export PDB + QA
 # ----------------------------
 
-def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_cfg: SanityConfig) -> None:
+def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_cfg: SanityConfig, verbose: int = 0) -> None:
     safe_mkdir(outdir)
+    vlog(1, verbose, f"[INFO] Discovering replicas under: {exp_root / 'runs'}")
 
     discovered, group_counts = discover_replicas(exp_root)
+    vlog(1, verbose, f"[INFO] Discovered {len(discovered)} replica directories across {len(group_counts)} groups.")
 
     # Report skeleton
     report = {
@@ -646,10 +653,12 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
     # For summary group-level later (placeholder)
     parsed_replicas: List[ParsedReplica] = []
 
-    for rp in discovered:
+    for idx, rp in enumerate(discovered, start=1):
         key = rp.key
         qa_status = "OK"
         qa_msgs: List[str] = []
+        replica_tag = f"{key.protein_id}/{key.peptide_id}/replica_{key.replica_id}"
+        vlog(1, verbose, f"[INFO] [{idx}/{len(discovered)}] Processing {replica_tag}")
 
         if rp.summary_path is None or not rp.summary_path.exists():
             qa_status = "MISSING_SUMMARY"
@@ -668,6 +677,7 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
                 "qa_status": qa_status,
                 "qa_message": "; ".join(qa_msgs),
             })
+            vlog(1, verbose, f"[WARN] {replica_tag}: missing *_summary.dlg; skipping parse.")
             continue
 
         try:
@@ -695,6 +705,7 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
                 "qa_status": qa_status,
                 "qa_message": "; ".join(qa_msgs),
             })
+            vlog(1, verbose, f"[WARN] {replica_tag}: parse error in summary ({repr(ex)}).")
             continue
 
         # Winner selection: prefer rank_openmm==1, else smallest rank_openmm
@@ -728,7 +739,7 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
             except Exception as ex:
                 qa_msgs.append(f"Winner export failed: {repr(ex)}")
         else:
-            qa_msgs.append("No rescored PDB found; skipping winner pose export.")
+                qa_msgs.append("No rescored PDB found; skipping winner pose export.")
 
         # Accumulate concat top-k blocks per group (if rescored exists)
         if rp.rescored_pdb_path and rp.rescored_pdb_path.exists():
@@ -807,6 +818,7 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
             qa_message="; ".join(qa_msgs).strip(),
         )
         parsed_replicas.append(parsed)
+        vlog(2, verbose, f"[DEBUG] {replica_tag}: qa_status={qa_status}, winner_model={parsed.winner_model_id}, winner_dEint={parsed.winner_omm_dE_interaction}")
 
         # replicas_parsed.csv row
         replicas_rows.append({
@@ -852,9 +864,11 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
 
         if qa_status == "OK":
             report["replicas_parsed_ok"] += 1
+            vlog(1, verbose, f"[OK]   {replica_tag}: parsed successfully.")
         else:
             report["replicas_parsed_fail"] += 1
             report["replica_failures"].append({"key": asdict(key), "reason": parsed.qa_message})
+            vlog(1, verbose, f"[WARN] {replica_tag}: completed with QA status {qa_status}.")
 
     # Write CSVs
     replicas_fields = [
@@ -870,6 +884,7 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
         "winner_pose_export_path",
     ]
     write_csv(outdir / "replicas_parsed.csv", replicas_rows, replicas_fields)
+    vlog(1, verbose, f"[INFO] Wrote {outdir / 'replicas_parsed.csv'} ({len(replicas_rows)} rows)")
 
     topk_fields = [
         "experiment_id", "protein_id", "peptide_id", "replica_id",
@@ -880,6 +895,7 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
         "qa_status",
     ]
     write_csv(outdir / "topk_parsed.csv", topk_rows, topk_fields)
+    vlog(1, verbose, f"[INFO] Wrote {outdir / 'topk_parsed.csv'} ({len(topk_rows)} rows)")
 
     clusters_fields = [
         "experiment_id", "protein_id", "peptide_id", "replica_id",
@@ -888,6 +904,7 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
         "qa_status",
     ]
     write_csv(outdir / "clusters_parsed.csv", clusters_rows, clusters_fields)
+    vlog(1, verbose, f"[INFO] Wrote {outdir / 'clusters_parsed.csv'} ({len(clusters_rows)} rows)")
 
     # Export concatenated top-k PDB per group
     concat_index_rows: List[Dict[str, object]] = []
@@ -937,6 +954,7 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
                   "experiment_id", "protein_id", "peptide_id", "k_per_replica", "n_models_total",
                   "concat_pdb_path", "concat_pose_only_pdb_path", "first_target_pdb_path", "deinter_dat_path",
               ])
+    vlog(1, verbose, f"[INFO] Wrote {outdir / 'topk_concat_index.csv'} ({len(concat_index_rows)} groups)")
 
     # ----------------------------
     # PHASE 2 (placeholder): Esquema de tablas -> métricas -> tests -> reporte
@@ -1021,6 +1039,7 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
         lines.append("No replica failures recorded.")
 
     write_text(outdir / "parse_report.txt", "\n".join(lines) + "\n")
+    vlog(1, verbose, f"[INFO] Wrote reports: {outdir / 'parse_report.json'} and {outdir / 'parse_report.txt'}")
 
 
 # ----------------------------
@@ -1035,6 +1054,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--exp-root", required=True, help="Experiment root directory (contains runs/).")
     p.add_argument("--outdir", required=True, help="Output directory (e.g., analysis).")
     p.add_argument("--topk", type=int, default=5, help="How many top OpenMM-ranked models per replica to export/concat (default: 5).")
+    p.add_argument("-v", "--verbose", action="count", default=0,
+                   help="Increase progress verbosity (-v: info, -vv: debug).")
 
     # Sanity filter options
     p.add_argument("--sanity-disable", action="store_true", help="Disable sanity checks on energies.")
@@ -1092,7 +1113,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     with (outdir / "run_info.json").open("w", encoding="utf-8") as f:
         json.dump(run_info, f, indent=2, sort_keys=True)
 
-    run_parse_and_consolidate(exp_root, outdir, topk_k=int(args.topk), sanity_cfg=sanity_cfg)
+    run_parse_and_consolidate(exp_root, outdir, topk_k=int(args.topk), sanity_cfg=sanity_cfg, verbose=int(args.verbose))
+    if args.verbose:
+        eprint(f"[INFO] Completed parse+consolidation for {exp_root} -> {outdir}")
 
     if args.compute_metrics:
         # Placeholder hook for future phases (intentionally not implemented).
