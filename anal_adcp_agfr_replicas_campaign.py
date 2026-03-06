@@ -543,19 +543,23 @@ def renumber_models(blocks: List[str], start_at: int = 1) -> str:
     return "".join(out_lines)
 
 
-def split_model_target_and_pose(block: str) -> Tuple[List[str], List[str]]:
+def split_model_target_and_pose(block: str) -> Tuple[List[str], List[str], str]:
     """
     Split MODEL block body lines into target-protein and pose sections.
 
     Heuristic:
-      - Prefer the LAST TER record as boundary:
+      - Prefer the FIRST TER record as boundary:
           target = lines up to (and including) that TER
           pose   = lines after that TER
-      - If no TER is present, leave target empty and mark whole model as pose.
+      - If no TER is present, try chain-based split:
+          identify first atom chain as target chain,
+          split before first atom that belongs to a different chain.
+      - If chain-based split cannot be inferred, leave target empty and
+        mark whole model as pose.
     """
     lines = block.splitlines(True)
     if not lines:
-        return [], []
+        return [], [], "empty"
 
     # MODEL ... ENDMDL excluded from split payload.
     body = lines[1:]
@@ -566,11 +570,32 @@ def split_model_target_and_pose(block: str) -> Tuple[List[str], List[str]]:
     for i, ln in enumerate(body):
         if ln.startswith("TER"):
             ter_idx = i
+            break
 
     if ter_idx >= 0:
-        return body[:ter_idx + 1], body[ter_idx + 1:]
+        return body[:ter_idx + 1], body[ter_idx + 1:], "first_ter"
 
-    return [], body
+    def _chain_id(pdb_line: str) -> str:
+        # PDB chain ID is column 22 (1-indexed), index 21 in Python.
+        return pdb_line[21].strip() if len(pdb_line) > 21 else ""
+
+    first_chain = ""
+    split_idx = -1
+    for i, ln in enumerate(body):
+        if not (ln.startswith("ATOM") or ln.startswith("HETATM")):
+            continue
+        cid = _chain_id(ln)
+        if not first_chain and cid:
+            first_chain = cid
+            continue
+        if first_chain and cid and cid != first_chain:
+            split_idx = i
+            break
+
+    if split_idx >= 0:
+        return body[:split_idx], body[split_idx:], "chain_fallback"
+
+    return [], body, "unsplit"
 
 
 # ----------------------------
@@ -649,6 +674,12 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
     group_to_pose_only_blocks: Dict[Tuple[str, str, str], List[str]] = {}
     group_to_first_target_lines: Dict[Tuple[str, str, str], List[str]] = {}
     group_to_deint_values: Dict[Tuple[str, str, str], List[float]] = {}
+    split_strategy_counts: Dict[str, int] = {
+        "first_ter": 0,
+        "chain_fallback": 0,
+        "unsplit": 0,
+        "empty": 0,
+    }
 
     # For summary group-level later (placeholder)
     parsed_replicas: List[ParsedReplica] = []
@@ -764,9 +795,15 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
 
                     pose_blocks: List[str] = []
                     for i, block in enumerate(blocks):
-                        target_lines, pose_lines = split_model_target_and_pose(block)
+                        target_lines, pose_lines, split_strategy = split_model_target_and_pose(block)
+                        split_strategy_counts[split_strategy] = split_strategy_counts.get(split_strategy, 0) + 1
                         if i == 0 and gk not in group_to_first_target_lines and target_lines:
                             group_to_first_target_lines[gk] = target_lines
+
+                        if split_strategy == "chain_fallback":
+                            qa_msgs.append("Target/pose split used chain-based fallback (no TER found).")
+                        elif split_strategy == "unsplit":
+                            qa_msgs.append("Could not split target/pose (no TER and no chain transition).")
 
                         if pose_lines:
                             pose_block = f"MODEL        1\n{''.join(pose_lines)}ENDMDL\n"
@@ -955,6 +992,13 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
                   "concat_pdb_path", "concat_pose_only_pdb_path", "first_target_pdb_path", "deinter_dat_path",
               ])
     vlog(1, verbose, f"[INFO] Wrote {outdir / 'topk_concat_index.csv'} ({len(concat_index_rows)} groups)")
+    print(
+        "[INFO] Target/pose split strategies used: "
+        f"first_ter={split_strategy_counts.get('first_ter', 0)}, "
+        f"chain_fallback={split_strategy_counts.get('chain_fallback', 0)}, "
+        f"unsplit={split_strategy_counts.get('unsplit', 0)}, "
+        f"empty={split_strategy_counts.get('empty', 0)}"
+    )
 
     # ----------------------------
     # PHASE 2 (placeholder): Esquema de tablas -> métricas -> tests -> reporte
