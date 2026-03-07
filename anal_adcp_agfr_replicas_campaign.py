@@ -26,6 +26,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Iterable
 
 
+SCRIPT_NAME = "anal_adcp_agfr_replicas_campaign.py"
+SCRIPT_VERSION = "v2"
+
+
 
 # ----------------------------
 # Utilidades generales
@@ -1210,6 +1214,14 @@ def _phase2_checklist_report(
     eps = 1e-6
     ts = now_iso()
 
+    def _fmt_replica_label(replica_id: object) -> str:
+        rid = str(replica_id)
+        try:
+            rid = f"{int(rid):03d}"
+        except Exception:
+            pass
+        return f"replica_{rid}"
+
     group_csv = outdir / "group_summary.csv"
     discr_csv = outdir / "protein_discrimination.csv"
     topk_index_csv = outdir / "topk_concat_index.csv"
@@ -1584,7 +1596,7 @@ def _phase2_checklist_report(
                     miss = kpr - c
                     sum_missing += miss
                     extra_path = f"; rescored_pdb={_truncate_path(ptxt)}" if str(ptxt).strip() else ""
-                    details_5.append(f"  - replica_{rid}: {c}/{kpr} (missing {miss}){extra_path}")
+                    details_5.append(f"  - {_fmt_replica_label(rid)}: {c}/{kpr} (missing {miss}){extra_path}")
                 details_5.append(f"  - Missing models accounted for by listed replicas: {sum_missing}/{group_missing}")
                 remaining_missing = group_missing - sum_missing
                 if remaining_missing > 0:
@@ -1598,6 +1610,7 @@ def _phase2_checklist_report(
         elif observed > expected:
             fail_5a.append(f"{pid}/{pep}: expected={expected}, observed={observed} (unexpected extra models)")
 
+    concat_topk_crosscheck_warnings = []
     for _, r in topk_idx.iterrows():
         pid, pep = str(r.get("protein_id", "")), str(r.get("peptide_id", ""))
         observed_models_topk = int(topk_group_counts.get((pid, pep), 0))
@@ -1605,9 +1618,14 @@ def _phase2_checklist_report(
         if observed_models_concat is None:
             continue
         if observed_models_concat != observed_models_topk:
-            warn_5a.append(
+            msg = (
                 f"{pid}/{pep}: concat MODEL count ({observed_models_concat}) differs from topk_parsed rows ({observed_models_topk}). Possible export bug; inspect concat generation."
             )
+            warn_5a.append(msg)
+            concat_topk_crosscheck_warnings.append(msg)
+
+    if not concat_topk_crosscheck_warnings:
+        details_5.append("5A PASS: concat MODEL counts match topk_parsed row counts for all concat groups.")
     if fail_5a:
         s5a = "FAIL"
         details_5.append("5A FAIL: topk_concat export structural mismatches.")
@@ -1709,6 +1727,7 @@ def _phase2_checklist_report(
     overall = _combine_status(s1, s2, s3, s4, s5)
 
     stdout_lines = [
+        f"Script: {SCRIPT_NAME} {SCRIPT_VERSION}",
         "===== Phase 2 Checklist (dockanalrep) =====",
         f"Timestamp: {ts}",
         f"Outdir: {outdir}",
@@ -1733,6 +1752,7 @@ def _phase2_checklist_report(
     ]
 
     md_lines = [
+        f"Script: `{SCRIPT_NAME} {SCRIPT_VERSION}`",
         "## Phase 2 Checklist",
         f"_Run: {ts}_",
         f"(outdir: `{outdir}`)",
