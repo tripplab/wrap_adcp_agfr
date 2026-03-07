@@ -1200,6 +1200,9 @@ def _phase2_checklist_report(
     poi_id: str,
     exclude_peptide_suffix: str,
     sanity_cfg: SanityConfig,
+    topk_k: int,
+    min_replicas: int,
+    alpha: float,
     checklist_max_detail: int,
     verbose: int = 0,
 ) -> Tuple[str, str]:
@@ -1210,15 +1213,17 @@ def _phase2_checklist_report(
     group_csv = outdir / "group_summary.csv"
     discr_csv = outdir / "protein_discrimination.csv"
     topk_index_csv = outdir / "topk_concat_index.csv"
+    topk_parsed_csv = outdir / "topk_parsed.csv"
     replicas_csv = outdir / "replicas_parsed.csv"
 
-    for req in [group_csv, discr_csv, topk_index_csv, replicas_csv]:
+    for req in [group_csv, discr_csv, topk_index_csv, topk_parsed_csv, replicas_csv]:
         if not req.exists():
             raise FileNotFoundError(f"Checklist requires {req}")
 
     group = pd.read_csv(group_csv)
     discr = pd.read_csv(discr_csv)
     topk_idx = pd.read_csv(topk_index_csv)
+    topk_parsed = pd.read_csv(topk_parsed_csv)
     replicas = pd.read_csv(replicas_csv)
 
     parse_groups = {}
@@ -1255,6 +1260,19 @@ def _phase2_checklist_report(
         discr["poi_id"] = discr["poi_id"].astype(str)
     if "control_id" in discr.columns:
         discr["control_id"] = discr["control_id"].astype(str)
+    for df in [topk_idx, topk_parsed, replicas]:
+        if "protein_id" in df.columns:
+            df["protein_id"] = df["protein_id"].astype(str)
+        if "peptide_id" in df.columns:
+            df["peptide_id"] = df["peptide_id"].astype(str)
+        if "replica_id" in df.columns:
+            df["replica_id"] = df["replica_id"].astype(str)
+
+    def _truncate_path(path_txt: str, max_len: int = 72) -> str:
+        ptxt = str(path_txt or "").strip()
+        if len(ptxt) <= max_len:
+            return ptxt
+        return "..." + ptxt[-(max_len - 3):]
 
     group_idx = {(r["protein_id"], r["peptide_id"]): r for _, r in group.iterrows()}
 
@@ -1303,6 +1321,7 @@ def _phase2_checklist_report(
     s1b = "PASS"
     fail_1b = []
     warn_1b = []
+    fail_1b_offenders = []
     proteins_with_poi = sorted(group[(group["peptide_id"] == poi_id) & (pd.to_numeric(group["n_used"], errors="coerce").fillna(0) > 0)]["protein_id"].unique().tolist())
     for prot in proteins_with_poi:
         sub = discr[(discr["protein_id"] == prot) & (discr.get("poi_id", "") == poi_id)]
@@ -1327,6 +1346,15 @@ def _phase2_checklist_report(
         exp_ctrl = int(_as_float(g_ctrl.get("n_used", 0)) or 0)
         if n_poi != exp_poi or n_ctrl != exp_ctrl:
             fail_1b.append(f"{pid}:{poi} vs {ctrl} n_poi/n_control=({n_poi},{n_ctrl}) expected ({exp_poi},{exp_ctrl})")
+            fail_1b_offenders.append({
+                "protein_id": pid,
+                "poi_id": poi,
+                "control_id": ctrl,
+                "n_poi": n_poi,
+                "n_used_poi": exp_poi,
+                "n_control": n_ctrl,
+                "n_used_control": exp_ctrl,
+            })
 
     if fail_1b:
         s1b = "FAIL"
@@ -1345,6 +1373,7 @@ def _phase2_checklist_report(
     s2a = "PASS"
     mild_2a = []
     fail_2a = []
+    fail_2a_offenders = []
     active = discr[~discr.get("flag_skipped", False).fillna(False).astype(bool)].copy() if not discr.empty else discr.copy()
     for _, r in active.iterrows():
         pid = str(r["protein_id"])
@@ -1364,10 +1393,12 @@ def _phase2_checklist_report(
             fail_2a.append(f"{pid}/{ctrl}: median_poi > median_control but delta_median={delta:.3g} < 0")
         if poi_better and auc < 0.45:
             fail_2a.append(f"{pid}/{ctrl}: POI better by medians but auc={auc:.3f} < 0.45")
+            fail_2a_offenders.append({"protein_id": pid, "control_id": ctrl, "median_poi": mp, "median_control": mc, "delta_median": delta, "auc": auc})
         elif poi_better and auc < 0.5:
             mild_2a.append(f"{pid}/{ctrl}: POI better by medians but auc={auc:.3f} mildly contradictory")
         if (not poi_better) and auc > 0.55:
             fail_2a.append(f"{pid}/{ctrl}: POI worse by medians but auc={auc:.3f} > 0.55")
+            fail_2a_offenders.append({"protein_id": pid, "control_id": ctrl, "median_poi": mp, "median_control": mc, "delta_median": delta, "auc": auc})
         elif (not poi_better) and auc > 0.5:
             mild_2a.append(f"{pid}/{ctrl}: POI worse by medians but auc={auc:.3f} mildly contradictory")
 
@@ -1419,6 +1450,7 @@ def _phase2_checklist_report(
 
     s3b = "PASS"
     fail_3b = []
+    fail_3b_offenders = []
     for pid, sub in non_skipped.groupby("protein_id", sort=True):
         sub = sub.copy()
         mask = sub["p_mwu"].notna()
@@ -1430,6 +1462,7 @@ def _phase2_checklist_report(
         for idx, (qo, qe) in enumerate(zip(q_observed, q_expected), start=1):
             if abs(qo - qe) > 1e-6:
                 fail_3b.append(f"{pid}: row#{idx} q_fdr={qo:.6g} expected_BH={qe:.6g}")
+                fail_3b_offenders.append({"protein_id": pid, "row": idx, "p_mwu": pvals[idx - 1], "q_reported": qo, "q_expected": qe})
     if fail_3b:
         s3b = "FAIL"
         details_3.append("3B FAIL: FDR appears not applied per protein with BH.")
@@ -1468,6 +1501,36 @@ def _phase2_checklist_report(
     # 5A + 5B
     s5a = "PASS"
     warn_5a, fail_5a = [], []
+
+    replica_topk_counts = {}
+    if not topk_parsed.empty:
+        replica_topk_counts = {
+            (pid, pep, rid): int(cnt)
+            for (pid, pep, rid), cnt in topk_parsed.groupby(["protein_id", "peptide_id", "replica_id"]).size().items()
+        }
+
+    replicas_by_group = {}
+    replica_path_by_key = {}
+    expected_winners = {}
+    if not replicas.empty:
+        score_col = _resolve_col(replicas, SCORE_SYNONYMS)
+        cluster_col = _resolve_col(replicas, CLUSTER_SYNONYMS)
+        qa_col = _resolve_col(replicas, QA_SYNONYMS)
+        if score_col and cluster_col and qa_col:
+            replicas[score_col] = pd.to_numeric(replicas[score_col], errors="coerce")
+            replicas[cluster_col] = pd.to_numeric(replicas[cluster_col], errors="coerce")
+            replicas["_excluded_reason"] = replicas.apply(
+                lambda rr: _excluded_reason(rr, score_col, cluster_col, qa_col, exclude_peptide_suffix, sanity_cfg), axis=1
+            )
+            for (pid, pep), sub in replicas.groupby(["protein_id", "peptide_id"], sort=False):
+                used_sub = sub[sub["_excluded_reason"] == "used"].copy()
+                replicas_by_group[(pid, pep)] = used_sub
+                exp = int(used_sub["rescored_pdb_path"].astype(str).str.strip().ne("").sum())
+                expected_winners[(pid, pep)] = exp
+                for _, rr in used_sub.iterrows():
+                    replica_path_by_key[(pid, pep, str(rr.get("replica_id", "")))] = str(rr.get("rescored_pdb_path", ""))
+
+    details_5.append("5A policy: PDB concat mismatch policy: WARN if observed<expected; FAIL if observed>expected or file missing.")
     for _, r in topk_idx.iterrows():
         pid, pep = str(r.get("protein_id", "")), str(r.get("peptide_id", ""))
         g = group_idx.get((pid, pep))
@@ -1488,6 +1551,17 @@ def _phase2_checklist_report(
             warn_5a.append(f"{pid}/{pep}: index n_models_total={indexed_obs}, MODEL count={streamed}; using streamed count")
         if observed < expected:
             warn_5a.append(f"{pid}/{pep}: expected={expected}, observed={observed}, missing={expected-observed}. Incomplete top-k in at least one replica (usually tolerable).")
+            if kpr > 0 and (pid, pep) in replicas_by_group:
+                incomplete = []
+                for _, rr in replicas_by_group[(pid, pep)].iterrows():
+                    rid = str(rr.get("replica_id", ""))
+                    c = int(replica_topk_counts.get((pid, pep, rid), 0))
+                    if c < kpr:
+                        incomplete.append((rid, c, replica_path_by_key.get((pid, pep, rid), "")))
+                incomplete.sort(key=lambda x: (x[1], x[0]))
+                for rid, c, ptxt in incomplete[:checklist_max_detail]:
+                    extra_path = f"; rescored_pdb={_truncate_path(ptxt)}" if str(ptxt).strip() else ""
+                    details_5.append(f"- {pid}/{pep} {rid}: models_in_topk_parsed={c} (expected k={kpr}){extra_path}")
         elif observed > expected:
             fail_5a.append(f"{pid}/{pep}: expected={expected}, observed={observed} (unexpected extra models)")
     if fail_5a:
@@ -1504,23 +1578,6 @@ def _phase2_checklist_report(
 
     s5b = "PASS"
     warn_5b, fail_5b = [], []
-    expected_winners = {}
-    if not replicas.empty:
-        replicas["protein_id"] = replicas["protein_id"].astype(str)
-        replicas["peptide_id"] = replicas["peptide_id"].astype(str)
-        score_col = _resolve_col(replicas, SCORE_SYNONYMS)
-        cluster_col = _resolve_col(replicas, CLUSTER_SYNONYMS)
-        qa_col = _resolve_col(replicas, QA_SYNONYMS)
-        if score_col and cluster_col and qa_col:
-            replicas[score_col] = pd.to_numeric(replicas[score_col], errors="coerce")
-            replicas[cluster_col] = pd.to_numeric(replicas[cluster_col], errors="coerce")
-            replicas["_excluded_reason"] = replicas.apply(
-                lambda rr: _excluded_reason(rr, score_col, cluster_col, qa_col, exclude_peptide_suffix, sanity_cfg), axis=1
-            )
-            for (pid, pep), sub in replicas.groupby(["protein_id", "peptide_id"], sort=False):
-                sub2 = sub[sub["_excluded_reason"] == "used"]
-                exp = int(sub2["rescored_pdb_path"].astype(str).str.strip().ne("").sum())
-                expected_winners[(pid, pep)] = exp
     for _, g in group.iterrows():
         pid, pep = str(g["protein_id"]), str(g["peptide_id"])
         n_used = int(_as_float(g.get("n_used", 0)) or 0)
@@ -1547,12 +1604,67 @@ def _phase2_checklist_report(
         details_5.append("5B PASS: winner export presence looks consistent for n_used>0 groups.")
     s5 = _combine_status(s5a, s5b)
 
+    quick_lines = []
+    for prot in proteins_with_poi:
+        sub = discr[(discr.get("protein_id", "") == prot) & (discr.get("poi_id", "") == poi_id)].copy()
+        if sub.empty:
+            continue
+        sub["q_fdr_sort"] = pd.to_numeric(sub.get("q_fdr"), errors="coerce").fillna(float("inf"))
+        sub["_priority"] = 2
+        sub.loc[sub["control_id"].astype(str).str.contains("decoy", case=False, na=False), "_priority"] = 0
+        sub.loc[sub["control_id"].astype(str).str.lower() == "polya", "_priority"] = 1
+        sub = sub.sort_values(["_priority", "q_fdr_sort", "control_id"], kind="stable")
+        chunks = []
+        for _, rr in sub.head(5).iterrows():
+            ctrl = str(rr.get("control_id", "?"))
+            skipped = bool(rr.get("flag_skipped", False))
+            if skipped:
+                chunks.append(f"POI vs {ctrl} SKIPPED(low-n)")
+            else:
+                auc = _as_float(rr.get("auc"))
+                qv = _as_float(rr.get("q_fdr"))
+                d1 = _as_float(rr.get("delta_f1"))
+                chunks.append(f"POI vs {ctrl} AUC={auc:.3f} q={qv:.3g} delta_f1={d1:+.2f}")
+        if chunks:
+            quick_lines.append(f"{prot}: " + "; ".join(chunks))
+
+    groups_in_group_summary = int(len(group))
+    groups_analyzed_nonlegacy = int(((~group["peptide_id"].astype(str).str.endswith(exclude_peptide_suffix)) & (pd.to_numeric(group["n_used"], errors="coerce").fillna(0) > 0)).sum())
+    comparisons_total = int(len(discr))
+    comparisons_skipped = int(discr.get("flag_skipped", False).fillna(False).astype(bool).sum()) if not discr.empty else 0
+    comparisons_run = int(max(0, comparisons_total - comparisons_skipped))
+    excluded_openmm_missing = int(pd.to_numeric(group.get("n_excluded_openmm_missing", 0), errors="coerce").fillna(0).sum())
+    excluded_legacy = int(pd.to_numeric(group.get("n_excluded_legacy", 0), errors="coerce").fillna(0).sum())
+    excluded_other = int(pd.to_numeric(group.get("n_excluded_other", 0), errors="coerce").fillna(0).sum())
+    replicas_total_detected = int(pd.to_numeric(group.get("n_detected", 0), errors="coerce").fillna(0).sum())
+    replicas_total_used = int(pd.to_numeric(group.get("n_used", 0), errors="coerce").fillna(0).sum())
+
+    offender_lines = []
+    if _combine_status(s1, s2, s3, s4, s5) == "FAIL":
+        offender_lines.append("Top offenders (first N):")
+        if s1b == "FAIL" and fail_1b_offenders:
+            offender_lines.append("- 1B join inconsistencies:")
+            for it in fail_1b_offenders[:checklist_max_detail]:
+                offender_lines.append(f"  - {it['protein_id']}, {it['poi_id']} vs {it['control_id']}, n_poi={it['n_poi']}, n_used_poi={it['n_used_poi']}, n_control={it['n_control']}, n_used_control={it['n_used_control']}")
+            offender_lines.append("  Action: revisar filtros de inclusión o merge keys.")
+        if s2a == "FAIL" and fail_2a_offenders:
+            offender_lines.append("- 2A orientation contradictions:")
+            for it in fail_2a_offenders[:checklist_max_detail]:
+                offender_lines.append(f"  - {it['protein_id']}/{it['control_id']}: median_poi={it['median_poi']:.3f}, median_control={it['median_control']:.3f}, delta_median={it['delta_median']:.3f}, auc={it['auc']:.3f}")
+            offender_lines.append("  Action: revisar bug de orientación en AUC.")
+        if s3b == "FAIL" and fail_3b_offenders:
+            offender_lines.append("- 3B FDR per-protein BH mismatches:")
+            for it in fail_3b_offenders[:checklist_max_detail]:
+                offender_lines.append(f"  - {it['protein_id']} row#{it['row']}: p={it['p_mwu']:.3g}, q_reported={it['q_reported']:.3g}, q_expected={it['q_expected']:.3g}")
+            offender_lines.append("  Action: recomputar BH por proteína y sobrescribir q_fdr por bloque protein_id.")
+
     overall = _combine_status(s1, s2, s3, s4, s5)
 
     stdout_lines = [
         "===== Phase 2 Checklist (dockanalrep) =====",
         f"Timestamp: {ts}",
         f"Outdir: {outdir}",
+        f"Config: k={topk_k}, min_replicas={min_replicas}, alpha={alpha}, FDR=BH-per-protein, legacy_suffix=\"{exclude_peptide_suffix}\"",
         f"1) Cobertura y coherencia básica: {s1}",
         *[f"   {x}" for x in details_1],
         f"2) Sentido de métricas: {s2}",
@@ -1563,6 +1675,11 @@ def _phase2_checklist_report(
         *[f"   {x}" for x in details_4],
         f"5) Verificación de exports PDB: {s5}",
         *[f"   {x}" for x in details_5],
+        f"Coverage: groups_in_group_summary={groups_in_group_summary}, groups_analyzed_nonlegacy={groups_analyzed_nonlegacy}, comparisons_total={comparisons_total}, comparisons_run={comparisons_run}, comparisons_skipped={comparisons_skipped}",
+        f"Replicas: total_detected={replicas_total_detected}, total_used={replicas_total_used}, excluded_legacy={excluded_legacy}, excluded_openmm_missing={excluded_openmm_missing}, excluded_other={excluded_other}",
+        "Protein summaries (quick):",
+        *[f"   - {x}" for x in quick_lines],
+        *[f"   {x}" for x in offender_lines],
         f"Overall: {overall}",
         "==========================================",
     ]
@@ -1571,6 +1688,7 @@ def _phase2_checklist_report(
         "## Phase 2 Checklist",
         f"_Run: {ts}_",
         f"(outdir: `{outdir}`)",
+        f"Config: `k={topk_k}, min_replicas={min_replicas}, alpha={alpha}, FDR=BH-per-protein, legacy_suffix=\"{exclude_peptide_suffix}\"`",
         "",
         f"### 1) Cobertura y coherencia básica — {s1}",
         *details_1,
@@ -1586,6 +1704,14 @@ def _phase2_checklist_report(
         "",
         f"### 5) Verificación de exports PDB — {s5}",
         *details_5,
+        "",
+        f"Coverage: groups_in_group_summary={groups_in_group_summary}, groups_analyzed_nonlegacy={groups_analyzed_nonlegacy}, comparisons_total={comparisons_total}, comparisons_run={comparisons_run}, comparisons_skipped={comparisons_skipped}",
+        f"Replicas: total_detected={replicas_total_detected}, total_used={replicas_total_used}, excluded_legacy={excluded_legacy}, excluded_openmm_missing={excluded_openmm_missing}, excluded_other={excluded_other}",
+        "",
+        "Protein summaries (quick):",
+        *[f"- {x}" for x in quick_lines],
+        "",
+        *offender_lines,
         "",
         f"**Overall: {overall}**",
         "",
@@ -2153,6 +2279,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             poi_id=str(args.poi_id),
             exclude_peptide_suffix=str(args.exclude_peptide_suffix),
             sanity_cfg=sanity_cfg,
+            topk_k=int(args.topk),
+            min_replicas=int(args.min_replicas),
+            alpha=float(args.alpha),
             checklist_max_detail=max(1, int(args.checklist_max_detail)),
             verbose=int(args.verbose),
         )
