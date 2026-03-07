@@ -1268,11 +1268,15 @@ def _phase2_checklist_report(
         if "replica_id" in df.columns:
             df["replica_id"] = df["replica_id"].astype(str)
 
-    def _truncate_path(path_txt: str, max_len: int = 72) -> str:
+    def _truncate_path(path_txt: str, max_len: int = 120) -> str:
         ptxt = str(path_txt or "").strip()
         if len(ptxt) <= max_len:
             return ptxt
-        return "..." + ptxt[-(max_len - 3):]
+        head_len = min(30, max_len - 3)
+        tail_len = max_len - 3 - head_len
+        if tail_len <= 0:
+            return ptxt[:max_len]
+        return f"{ptxt[:head_len]}...{ptxt[-tail_len:]}"
 
     group_idx = {(r["protein_id"], r["peptide_id"]): r for _, r in group.iterrows()}
 
@@ -1501,6 +1505,7 @@ def _phase2_checklist_report(
     # 5A + 5B
     s5a = "PASS"
     warn_5a, fail_5a = [], []
+    has_underfilled_group_5a = False
 
     replica_topk_counts = {}
     if not topk_parsed.empty:
@@ -1531,6 +1536,14 @@ def _phase2_checklist_report(
                     replica_path_by_key[(pid, pep, str(rr.get("replica_id", "")))] = str(rr.get("rescored_pdb_path", ""))
 
     details_5.append("5A policy: PDB concat mismatch policy: WARN if observed<expected; FAIL if observed>expected or file missing.")
+    topk_group_counts = {}
+    if not topk_parsed.empty:
+        topk_group_counts = {
+            (pid, pep): int(cnt)
+            for (pid, pep), cnt in topk_parsed.groupby(["protein_id", "peptide_id"]).size().items()
+        }
+
+    concat_model_count_by_group = {}
     for _, r in topk_idx.iterrows():
         pid, pep = str(r.get("protein_id", "")), str(r.get("peptide_id", ""))
         g = group_idx.get((pid, pep))
@@ -1547,32 +1560,67 @@ def _phase2_checklist_report(
             continue
         streamed = _count_model_lines_streaming(path)
         observed = streamed
+        concat_model_count_by_group[(pid, pep)] = observed
         if indexed_obs != streamed:
             warn_5a.append(f"{pid}/{pep}: index n_models_total={indexed_obs}, MODEL count={streamed}; using streamed count")
         if observed < expected:
-            warn_5a.append(f"{pid}/{pep}: expected={expected}, observed={observed}, missing={expected-observed}. Incomplete top-k in at least one replica (usually tolerable).")
+            group_missing = expected - observed
+            has_underfilled_group_5a = True
+            details_5.append(f"- {pid}/{pep}: expected={expected}, observed={observed}, missing={group_missing} (WARN)")
             if kpr > 0 and (pid, pep) in replicas_by_group:
                 incomplete = []
                 for _, rr in replicas_by_group[(pid, pep)].iterrows():
                     rid = str(rr.get("replica_id", ""))
                     c = int(replica_topk_counts.get((pid, pep, rid), 0))
                     if c < kpr:
-                        incomplete.append((rid, c, replica_path_by_key.get((pid, pep, rid), "")))
+                        ptxt = replica_path_by_key.get((pid, pep, rid), "")
+                        pp = Path(str(ptxt)) if str(ptxt).strip() else None
+                        incomplete.append((rid, c, ptxt, pp.exists() if pp else False, bool(pp)))
                 incomplete.sort(key=lambda x: (x[1], x[0]))
-                for rid, c, ptxt in incomplete[:checklist_max_detail]:
+                listed = incomplete[:checklist_max_detail]
+                sum_missing = 0
+                has_missing_file = any((not has_path) or (has_path and not exists) for _, _, _, exists, has_path in incomplete)
+                for rid, c, ptxt, exists, has_path in listed:
+                    miss = kpr - c
+                    sum_missing += miss
                     extra_path = f"; rescored_pdb={_truncate_path(ptxt)}" if str(ptxt).strip() else ""
-                    details_5.append(f"- {pid}/{pep} {rid}: models_in_topk_parsed={c} (expected k={kpr}){extra_path}")
+                    details_5.append(f"  - replica_{rid}: {c}/{kpr} (missing {miss}){extra_path}")
+                details_5.append(f"  - Missing models accounted for by listed replicas: {sum_missing}/{group_missing}")
+                remaining_missing = group_missing - sum_missing
+                if remaining_missing > 0:
+                    details_5.append(f"  - ... plus {remaining_missing} missing models not shown (increase --checklist-max-detail)")
+                if has_missing_file:
+                    details_5.append("  - Likely cause: missing rescored PDB for some replicas (OpenMM stage missing).")
+                else:
+                    details_5.append("  - Likely cause: rescored PDB contains fewer than k MODEL blocks for one or more replicas (OpenMM stage produced <k outputs or output truncated).")
+            else:
+                details_5.append("  - Likely cause: rescored PDB contains fewer than k MODEL blocks for one or more replicas (OpenMM stage produced <k outputs or output truncated).")
         elif observed > expected:
             fail_5a.append(f"{pid}/{pep}: expected={expected}, observed={observed} (unexpected extra models)")
+
+    for _, r in topk_idx.iterrows():
+        pid, pep = str(r.get("protein_id", "")), str(r.get("peptide_id", ""))
+        observed_models_topk = int(topk_group_counts.get((pid, pep), 0))
+        observed_models_concat = concat_model_count_by_group.get((pid, pep))
+        if observed_models_concat is None:
+            continue
+        if observed_models_concat != observed_models_topk:
+            warn_5a.append(
+                f"{pid}/{pep}: concat MODEL count ({observed_models_concat}) differs from topk_parsed rows ({observed_models_topk}). Possible export bug; inspect concat generation."
+            )
     if fail_5a:
         s5a = "FAIL"
         details_5.append("5A FAIL: topk_concat export structural mismatches.")
         details_5.extend([f"- {x}" for x in fail_5a[:checklist_max_detail]])
-    elif warn_5a:
+    elif has_underfilled_group_5a or warn_5a:
         s5a = "WARN"
-        details_5.append("5A WARN: topk_concat has fewer models than expected in some groups.")
+        if has_underfilled_group_5a:
+            details_5.append("5A WARN: topk_concat has fewer models than expected in some groups.")
+        else:
+            details_5.append("5A WARN: topk_concat cross-check warnings detected.")
         details_5.extend([f"- {x}" for x in warn_5a[:checklist_max_detail]])
-        details_5.append("- Action: if needed, rerun replicas with incomplete rescored MODEL blocks.")
+        if has_underfilled_group_5a:
+            details_5.append("- Action: if needed, rerun replicas with incomplete rescored MODEL blocks.")
     else:
         details_5.append("5A PASS: topk_concat MODEL counts match expected k_per_replica*n_used.")
 
