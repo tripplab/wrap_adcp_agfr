@@ -936,7 +936,7 @@ def run_phase2_from_replicas_csv(
         })
 
     group_summary = pd.DataFrame(group_rows, columns=PHASE2_GROUP_SUMMARY_FIELDS)
-    group_summary.to_csv(outdir / "group_summary.csv", index=False)
+    group_summary.to_csv(outdir / "group_summary.csv", index=False, float_format="%.2f")
 
     gidx = {(r["protein_id"], r["peptide_id"]): r for r in group_rows}
     discr_rows = []
@@ -1002,7 +1002,7 @@ def run_phase2_from_replicas_csv(
                 sub.loc[mask, "q_fdr"] = qvals
             out_pieces.append(sub)
         discr_df = pd.concat(out_pieces, ignore_index=True)
-    discr_df.to_csv(outdir / "protein_discrimination.csv", index=False)
+    discr_df.to_csv(outdir / "protein_discrimination.csv", index=False, float_format="%.2f")
 
     global_rows = []
     for protein_id, sub in discr_df.groupby("protein_id", sort=True):
