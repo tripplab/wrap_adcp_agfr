@@ -42,6 +42,27 @@ CLASS_TO_AA: Dict[str, List[str]] = {}
 for aa, cls in CLASS_MAP.items():
     CLASS_TO_AA.setdefault(cls, []).append(aa)
 
+COARSE_GROUPS = {
+    "hydrophobic": list("AVLIM"),
+    "aromatic": list("FYW"),
+    "positive": list("KRH"),
+    "negative": list("DE"),
+    "polar": list("STNQ"),
+    "special": list("CPG"),
+}
+AA_TO_COARSE_GROUP = {aa: group for group, residues in COARSE_GROUPS.items() for aa in residues}
+SOFT_KEYS = [
+    "charge_at_ph",
+    "pI",
+    "hydro_mean",
+    "hydro_var",
+    "aromatic_burden",
+    "cpg_burden",
+    "complexity",
+    "charge_patterning",
+    "hydro_blockiness",
+]
+
 PKA = {"Nterm": 9.69, "Cterm": 2.34, "K": 10.5, "R": 12.5, "H": 6.0, "D": 3.9, "E": 4.1, "C": 8.3, "Y": 10.1}
 
 
@@ -465,17 +486,54 @@ def descriptor_deltas(desc: Descriptor, poi: Descriptor) -> Dict[str, float]:
     return out
 
 
-def soft_tolerance_ok(desc: Descriptor, poi: Descriptor, cfg: Config, stage: int, run: RunStats) -> bool:
+def current_soft_scale(stage: int) -> float:
+    return 1.0 + 0.25 * stage
+
+
+def soft_tolerance_failures(desc: Descriptor, poi: Descriptor, cfg: Config, stage: int) -> List[str]:
     if cfg.decoy_class != "property-matched":
-        return True
-    scale = 1.0 + 0.25 * stage
-    for key, tol in cfg.property_tolerances.items():
-        delta = abs(desc.as_dict()[key] - poi.as_dict()[key])
+        return []
+    scale = current_soft_scale(stage)
+    desc_map = desc.as_dict()
+    poi_map = poi.as_dict()
+    failed = []
+    for key in SOFT_KEYS:
+        tol = cfg.property_tolerances[key]
+        delta = abs(desc_map[key] - poi_map[key])
         if delta > tol * scale + 1e-12:
-            return False
-    if stage > 0:
-        run.relax_log.append({"stage": stage, "scale": scale, "relaxed_parameters": sorted(cfg.property_tolerances.keys())})
-    return True
+            failed.append(key)
+    return failed
+
+
+def init_candidate_property_matched(poi: str, rng: random.Random) -> str:
+    L = len(poi)
+    poi_counts = Counter(poi)
+    target_arom = poi_counts["F"] + poi_counts["Y"] + poi_counts["W"]
+    target_cpg = poi_counts["C"] + poi_counts["P"] + poi_counts["G"]
+    target_pos = poi_counts["K"] + poi_counts["R"]
+    target_neg = poi_counts["D"] + poi_counts["E"]
+    pos_bias = max(0, target_pos - target_neg)
+    neg_bias = max(0, target_neg - target_pos)
+    neutral_target = max(0, L - pos_bias - neg_bias)
+
+    pool: List[str] = []
+    pool.extend(rng.choices(["F", "Y", "W"], k=target_arom))
+    pool.extend(rng.choices(["C", "P", "G"], k=target_cpg))
+    pool.extend(rng.choices(["K", "R", "H"], k=pos_bias))
+    pool.extend(rng.choices(["D", "E"], k=neg_bias))
+
+    neutral_pool = ["A", "V", "L", "I", "M", "T", "S", "N", "Q", "G", "P"]
+    pool.extend(rng.choices(neutral_pool, k=neutral_target))
+
+    if len(pool) > L:
+        rng.shuffle(pool)
+        pool = pool[:L]
+    elif len(pool) < L:
+        # Prefer filling with moderate hydrophobicity residues to stay near typical POI manifold.
+        pool.extend(rng.choices(["A", "V", "L", "T", "S", "Q"], k=L - len(pool)))
+
+    rng.shuffle(pool)
+    return "".join(pool)
 
 
 def init_candidate(poi: str, cfg: Config, rng: random.Random) -> str:
@@ -487,7 +545,7 @@ def init_candidate(poi: str, cfg: Config, rng: random.Random) -> str:
         labels = [CLASS_MAP[a] for a in poi]
         rng.shuffle(labels)
         return "".join(rng.choice(CLASS_TO_AA[c]) for c in labels)
-    return "".join(rng.choice(AA_LIST) for _ in range(len(poi)))
+    return init_candidate_property_matched(poi, rng)
 
 
 def move(seq: str, cfg: Config, rng: random.Random) -> str:
@@ -505,23 +563,33 @@ def move(seq: str, cfg: Config, rng: random.Random) -> str:
             cls = CLASS_MAP[s[i]]
             s[i] = rng.choice(CLASS_TO_AA[cls])
     else:
-        i = rng.randrange(L)
-        s[i] = rng.choice(AA_LIST)
+        r = rng.random()
+        if r < 0.45:
+            i = rng.randrange(L)
+            s[i] = rng.choice(AA_LIST)
+        elif r < 0.7:
+            i, j = rng.randrange(L), rng.randrange(L)
+            s[i], s[j] = s[j], s[i]
+        else:
+            i = rng.randrange(L)
+            group = AA_TO_COARSE_GROUP[s[i]]
+            s[i] = rng.choice(COARSE_GROUPS[group])
     return "".join(s)
 
 
-def anneal_one(poi: str, poi_desc: Descriptor, cfg: Config, rng: random.Random, seed_i: int,
+def anneal_one(poi: str, poi_desc: Descriptor, cfg: Config, seed_i: int,
                mode_meta: Dict[str, Any], stage: int, run: RunStats, seen: Set[str]) -> Optional[DecoyResult]:
-    start = init_candidate(poi, cfg, rng)
+    local_rng = random.Random(seed_i)
+    start = init_candidate(poi, cfg, local_rng)
     current = start
     current_desc = describe(current, cfg)
     current_score = objective(current_desc, poi_desc, cfg.weights)
-    best = None
-    best_score = float("inf")
+    best = (current, current_desc, current_score)
+    best_score = current_score
 
     for step in range(cfg.anneal.steps):
         t = cfg.anneal.t_start * ((cfg.anneal.t_end / cfg.anneal.t_start) ** (step / max(1, cfg.anneal.steps - 1)))
-        prop = move(current, cfg, rng)
+        prop = move(current, cfg, local_rng)
         run.generated_attempts += 1
 
         ok, reason = hard_check(prop, cfg, poi, set(), mode_meta)
@@ -530,25 +598,29 @@ def anneal_one(poi: str, poi_desc: Descriptor, cfg: Config, rng: random.Random, 
             continue
 
         d = describe(prop, cfg)
-        if not soft_tolerance_ok(d, poi_desc, cfg, stage, run):
-            run.rejections["soft_tolerance"] = run.rejections.get("soft_tolerance", 0) + 1
-            continue
         sc = objective(d, poi_desc, cfg.weights)
 
-        accept = sc < current_score or rng.random() < math.exp(-(sc - current_score) / max(t, 1e-9))
+        accept = sc < current_score or local_rng.random() < math.exp(-(sc - current_score) / max(t, 1e-9))
         if accept:
             current, current_desc, current_score = prop, d, sc
         if sc < best_score:
             best = (prop, d, sc)
             best_score = sc
 
-    if not best:
-        return None
     seq, d, sc = best
     ok, reason = hard_check(seq, cfg, poi, seen, mode_meta)
     if not ok:
         run.rejections[reason] = run.rejections.get(reason, 0) + 1
         return None
+
+    soft_failed = soft_tolerance_failures(d, poi_desc, cfg, stage)
+    if soft_failed:
+        run.rejections["soft_tolerance"] = run.rejections.get("soft_tolerance", 0) + 1
+        for key in soft_failed:
+            bucket = f"soft_tolerance_{key.lower()}"
+            run.rejections[bucket] = run.rejections.get(bucket, 0) + 1
+        return None
+
     matches, ident = identity_stats(seq, poi)
     run.valid_candidates += 1
     return DecoyResult(
@@ -611,6 +683,7 @@ def write_report(cfg: Config, poi_desc: Descriptor, stats: RunStats, pool_size: 
                  diversity: Dict[str, Any], partial: bool, failed: bool, seed: int) -> None:
     if not cfg.run_report_json:
         return
+    soft_breakdown = {f"soft_tolerance_{k.lower()}": stats.rejections.get(f"soft_tolerance_{k.lower()}", 0) for k in SOFT_KEYS}
     report = {
         "poi_summary": {"sequence": cfg.poi, "descriptor": poi_desc.as_dict()},
         "decoy_class": cfg.decoy_class,
@@ -629,6 +702,7 @@ def write_report(cfg: Config, poi_desc: Descriptor, stats: RunStats, pool_size: 
         "annealing_settings": cfg.anneal.__dict__,
         "requested_generated_selected": {"requested": cfg.n, "pool_valid": pool_size, "selected": selected},
         "rejection_reasons": stats.rejections,
+        "soft_tolerance_breakdown": soft_breakdown,
         "partial": partial,
         "failed": failed,
         "relaxation_used": stats.relax_log,
@@ -640,7 +714,6 @@ def write_report(cfg: Config, poi_desc: Descriptor, stats: RunStats, pool_size: 
 
 
 def generate_decoys(cfg: Config, seed: int, stats: RunStats) -> Tuple[List[DecoyResult], Dict[str, Any], bool, bool, int]:
-    rng = random.Random(seed)
     poi_desc = describe(cfg.poi, cfg)
     print(f"[pepctrl] POI descriptor: {json.dumps(poi_desc.as_dict(), sort_keys=True)}")
     mode_meta = {
@@ -654,10 +727,16 @@ def generate_decoys(cfg: Config, seed: int, stats: RunStats) -> Tuple[List[Decoy
     stage_max = cfg.max_relax_stage if cfg.relaxation else 0
 
     for stage in range(stage_max + 1):
+        if stage > 0 and cfg.decoy_class == "property-matched":
+            stats.relax_log.append({
+                "stage": stage,
+                "scale": current_soft_scale(stage),
+                "relaxed_parameters": sorted(cfg.property_tolerances.keys()),
+            })
         while len(pool) < target_pool:
             idx = len(pool) + 1
             one_seed = seed + stage * 100000 + idx
-            cand = anneal_one(cfg.poi, poi_desc, cfg, rng, one_seed, mode_meta, stage, stats, seen)
+            cand = anneal_one(cfg.poi, poi_desc, cfg, one_seed, mode_meta, stage, stats, seen)
             if cand:
                 pool.append(cand)
                 seen.add(cand.sequence)
@@ -727,7 +806,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
         return 0
 
-    rng = random.Random(seed)
     seqs = generate_scramble_set(cfg.poi, cfg.n, rng) if cfg.seq_type == "scramble" else generate_random_set(len(cfg.poi), cfg.n, rng)
     for i, s in enumerate(seqs, 1):
         print(f">{cfg.seq_type[0].upper()}{i:04d}\n{s}")
