@@ -171,6 +171,55 @@ class RunStats:
     rejections: Dict[str, int] = field(default_factory=dict)
     relax_log: List[Dict[str, Any]] = field(default_factory=list)
     timings: Dict[str, float] = field(default_factory=dict)
+    anneal_runs_started: int = 0
+    anneal_runs_completed: int = 0
+    total_proposals_generated: int = 0
+    total_sequences_described: int = 0
+    total_hard_valid_proposals: int = 0
+    total_hard_failures: int = 0
+    total_soft_failures: int = 0
+    total_soft_valid_candidates: int = 0
+    total_best_of_run_candidates: int = 0
+    total_pool_admissions: int = 0
+    total_duplicate_rejections: int = 0
+    target_pool_expected: int = 0
+    pool_valid_achieved: int = 0
+    written_files: List[Dict[str, str]] = field(default_factory=list)
+
+
+def safe_rate(num: float, den: float) -> float:
+    return num / den if den else 0.0
+
+
+def build_breakdown(counts: Dict[str, int], denom: int) -> Dict[str, Dict[str, float]]:
+    return {
+        key: {
+            "count": val,
+            "pct_of_failures": safe_rate(val, sum(counts.values())),
+            "pct_of_total_proposals": safe_rate(val, denom),
+        }
+        for key, val in sorted(counts.items())
+    }
+
+
+def build_sampling_summary(stats: RunStats) -> Dict[str, float]:
+    return {
+        "anneal_runs_started": stats.anneal_runs_started,
+        "anneal_runs_completed": stats.anneal_runs_completed,
+        "total_proposals_generated": stats.total_proposals_generated,
+        "total_sequences_described": stats.total_sequences_described,
+        "total_hard_valid_proposals": stats.total_hard_valid_proposals,
+        "total_soft_valid_candidates": stats.total_soft_valid_candidates,
+        "total_best_of_run_candidates": stats.total_best_of_run_candidates,
+        "total_pool_admissions": stats.total_pool_admissions,
+        "total_final_selected": stats.selected_final,
+        "target_pool": stats.target_pool_expected,
+        "achieved_pool": stats.pool_valid_achieved,
+        "acceptance_rate_hard_valid": safe_rate(stats.total_hard_valid_proposals, stats.total_proposals_generated),
+        "acceptance_rate_soft_valid": safe_rate(stats.total_soft_valid_candidates, stats.total_hard_valid_proposals),
+        "acceptance_rate_pool": safe_rate(stats.total_pool_admissions, stats.total_best_of_run_candidates),
+        "final_selection_rate": safe_rate(stats.selected_final, stats.total_pool_admissions),
+    }
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -579,8 +628,10 @@ def move(seq: str, cfg: Config, rng: random.Random) -> str:
 
 def anneal_one(poi: str, poi_desc: Descriptor, cfg: Config, seed_i: int,
                mode_meta: Dict[str, Any], stage: int, run: RunStats, seen: Set[str]) -> Optional[DecoyResult]:
+    run.anneal_runs_started += 1
     local_rng = random.Random(seed_i)
     start = init_candidate(poi, cfg, local_rng)
+    run.total_sequences_described += 1
     current = start
     current_desc = describe(current, cfg)
     current_score = objective(current_desc, poi_desc, cfg.weights)
@@ -591,12 +642,16 @@ def anneal_one(poi: str, poi_desc: Descriptor, cfg: Config, seed_i: int,
         t = cfg.anneal.t_start * ((cfg.anneal.t_end / cfg.anneal.t_start) ** (step / max(1, cfg.anneal.steps - 1)))
         prop = move(current, cfg, local_rng)
         run.generated_attempts += 1
+        run.total_proposals_generated += 1
 
         ok, reason = hard_check(prop, cfg, poi, set(), mode_meta)
         if not ok:
+            run.total_hard_failures += 1
             run.rejections[reason] = run.rejections.get(reason, 0) + 1
             continue
 
+        run.total_hard_valid_proposals += 1
+        run.total_sequences_described += 1
         d = describe(prop, cfg)
         sc = objective(d, poi_desc, cfg.weights)
 
@@ -608,21 +663,30 @@ def anneal_one(poi: str, poi_desc: Descriptor, cfg: Config, seed_i: int,
             best_score = sc
 
     seq, d, sc = best
+    run.total_best_of_run_candidates += 1
     ok, reason = hard_check(seq, cfg, poi, seen, mode_meta)
     if not ok:
+        run.total_hard_failures += 1
+        if reason == "duplicate":
+            run.total_duplicate_rejections += 1
         run.rejections[reason] = run.rejections.get(reason, 0) + 1
+        run.anneal_runs_completed += 1
         return None
 
     soft_failed = soft_tolerance_failures(d, poi_desc, cfg, stage)
     if soft_failed:
+        run.total_soft_failures += 1
         run.rejections["soft_tolerance"] = run.rejections.get("soft_tolerance", 0) + 1
         for key in soft_failed:
             bucket = f"soft_tolerance_{key.lower()}"
             run.rejections[bucket] = run.rejections.get(bucket, 0) + 1
+        run.anneal_runs_completed += 1
         return None
 
+    run.total_soft_valid_candidates += 1
     matches, ident = identity_stats(seq, poi)
     run.valid_candidates += 1
+    run.anneal_runs_completed += 1
     return DecoyResult(
         sequence=seq,
         decoy_class=cfg.decoy_class,
@@ -639,8 +703,10 @@ def anneal_one(poi: str, poi_desc: Descriptor, cfg: Config, seed_i: int,
 
 def select_diverse(pool: List[DecoyResult], n: int, max_ident: float) -> Tuple[List[DecoyResult], Dict[str, Any]]:
     chosen: List[DecoyResult] = []
+    diversity_rejections = 0
     for cand in sorted(pool, key=lambda x: x.objective_score):
         if any(identity_stats(cand.sequence, x.sequence)[1] > max_ident + 1e-12 for x in chosen):
+            diversity_rejections += 1
             continue
         chosen.append(cand)
         if len(chosen) == n:
@@ -649,10 +715,14 @@ def select_diverse(pool: List[DecoyResult], n: int, max_ident: float) -> Tuple[L
     for i in range(len(chosen)):
         for j in range(i + 1, len(chosen)):
             min_pair = min(min_pair, identity_stats(chosen[i].sequence, chosen[j].sequence)[1])
-    return chosen, {"strict_max_pairwise_identity": max_ident, "observed_min_pairwise_identity": min_pair if len(chosen) > 1 else None}
+    return chosen, {
+        "strict_max_pairwise_identity": max_ident,
+        "observed_min_pairwise_identity": min_pair if len(chosen) > 1 else None,
+        "rejected_by_diversity_filter": diversity_rejections,
+    }
 
 
-def write_decoys(decoys: List[DecoyResult], poi: str, poi_desc: Descriptor, cfg: Config) -> None:
+def write_decoys(decoys: List[DecoyResult], poi: str, poi_desc: Descriptor, cfg: Config, stats: RunStats) -> None:
     cols = ["decoy_id", "decoy_class", "sequence", "seed", "objective_score", "descriptors", "descriptor_deltas_vs_poi",
             "identity_to_poi", "matches_to_poi", "relaxation_stage_used", "flags"]
     h = sys.stdout if cfg.out == "-" else open(cfg.out, "w", encoding="utf-8", newline="")
@@ -677,13 +747,93 @@ def write_decoys(decoys: List[DecoyResult], poi: str, poi_desc: Descriptor, cfg:
     finally:
         if h is not sys.stdout:
             h.close()
+    stats.written_files.append({
+        "path": cfg.out,
+        "kind": "accepted_sequences_table",
+        "format": cfg.fmt,
+        "description": "tabla de secuencias aceptadas con descriptores y deltas vs POI",
+    })
 
+
+
+
+def accepted_sequences_summary(decoys: List[DecoyResult]) -> List[Dict[str, Any]]:
+    out = []
+    for i, d in enumerate(decoys, 1):
+        out.append({
+            "decoy_id": f"D{i:04d}",
+            "sequence": d.sequence,
+            "objective_score": d.objective_score,
+            "identity_to_poi": d.identity_to_poi,
+            "matches_to_poi": d.matches_to_poi,
+            "charge_at_ph": d.descriptor.charge_at_ph,
+            "pI": d.descriptor.pI,
+            "hydro_mean": d.descriptor.hydro_mean,
+            "hydro_var": d.descriptor.hydro_var,
+            "aromatic_burden": d.descriptor.aromatic_burden,
+            "cpg_burden": d.descriptor.cpg_burden,
+            "complexity": d.descriptor.complexity,
+            "charge_patterning": d.descriptor.charge_patterning,
+            "hydro_blockiness": d.descriptor.hydro_blockiness,
+            "relaxation_stage_used": d.relaxation_stage_used,
+        })
+    return out
+
+
+def print_stdout_summary(cfg: Config, stats: RunStats, poi_desc: Descriptor, decoys: List[DecoyResult], partial: bool, failed: bool, seed: int) -> None:
+    sampling = build_sampling_summary(stats)
+    hard_counts = {k: v for k, v in stats.rejections.items() if not k.startswith("soft_tolerance")}
+    soft_counts = {k: v for k, v in stats.rejections.items() if k.startswith("soft_tolerance_")}
+    hard_breakdown = build_breakdown(hard_counts, stats.total_proposals_generated)
+    soft_breakdown = build_breakdown(soft_counts, stats.total_proposals_generated)
+
+    print("[pepctrl] sampling_summary:")
+    for k, v in sampling.items():
+        print(f"[pepctrl]   {k}: {v}")
+
+    print(f"[pepctrl] rejection_totals: total_hard_failures={stats.total_hard_failures} total_soft_failures={stats.total_soft_failures}")
+    print("[pepctrl] hard_failure_breakdown:")
+    for k, v in hard_breakdown.items():
+        print(f"[pepctrl]   {k}: count={v['count']} pct_of_failures={v['pct_of_failures']:.4f} pct_of_total_proposals={v['pct_of_total_proposals']:.4f}")
+    print("[pepctrl] soft_failure_breakdown (counts are failures per descriptor; soft_tolerance counts failed sequences):")
+    for k, v in soft_breakdown.items():
+        print(f"[pepctrl]   {k}: count={v['count']} pct_of_failures={v['pct_of_failures']:.4f} pct_of_total_proposals={v['pct_of_total_proposals']:.4f}")
+
+    print("[pepctrl] written_files:")
+    for wf in stats.written_files:
+        print(f"[pepctrl]   path={wf['path']} kind={wf['kind']} format={wf['format']} description={wf['description']}")
+
+    print(f"[pepctrl] accepted_sequences: {len(decoys)}")
+    if decoys:
+        for i, d in enumerate(decoys, 1):
+            print(
+                f"[pepctrl] D{i:04d} seq={d.sequence} obj={d.objective_score:.6g} id={d.identity_to_poi:.4f} "
+                f"matches={d.matches_to_poi} charge_at_ph={d.descriptor.charge_at_ph:.4f} pI={d.descriptor.pI:.4f} "
+                f"hydro_mean={d.descriptor.hydro_mean:.4f} hydro_var={d.descriptor.hydro_var:.4f} "
+                f"aromatic_burden={d.descriptor.aromatic_burden:.4f} cpg_burden={d.descriptor.cpg_burden:.4f} "
+                f"complexity={d.descriptor.complexity:.4f} charge_patterning={d.descriptor.charge_patterning:.4f} "
+                f"hydro_blockiness={d.descriptor.hydro_blockiness:.4f} relaxation_stage_used={d.relaxation_stage_used}"
+            )
+    else:
+        print("[pepctrl] No se aceptaron secuencias en la selección final.")
+
+    print(
+        f"[pepctrl] final_poi_reference sequence={cfg.poi} charge_at_ph={poi_desc.charge_at_ph:.4f} pI={poi_desc.pI:.4f} "
+        f"hydro_mean={poi_desc.hydro_mean:.4f}"
+    )
+    print(
+        f"[pepctrl] final_status requested={cfg.n} target_pool={stats.target_pool_expected} pool_valid={stats.pool_valid_achieved} "
+        f"selected={stats.selected_final} partial={partial} failed={failed} total_s={stats.timings.get('total_s', 0.0):.4f} seed={seed}"
+    )
 
 def write_report(cfg: Config, poi_desc: Descriptor, stats: RunStats, pool_size: int, selected: int,
-                 diversity: Dict[str, Any], partial: bool, failed: bool, seed: int) -> None:
+                 diversity: Dict[str, Any], partial: bool, failed: bool, seed: int, decoys: List[DecoyResult]) -> None:
     if not cfg.run_report_json:
         return
-    soft_breakdown = {f"soft_tolerance_{k.lower()}": stats.rejections.get(f"soft_tolerance_{k.lower()}", 0) for k in SOFT_KEYS}
+    soft_breakdown_legacy = {f"soft_tolerance_{k.lower()}": stats.rejections.get(f"soft_tolerance_{k.lower()}", 0) for k in SOFT_KEYS}
+    hard_counts = {k: v for k, v in stats.rejections.items() if not k.startswith("soft_tolerance")}
+    soft_counts = {k: v for k, v in stats.rejections.items() if k.startswith("soft_tolerance_")}
+    sampling_summary = build_sampling_summary(stats)
     report = {
         "poi_summary": {"sequence": cfg.poi, "descriptor": poi_desc.as_dict()},
         "decoy_class": cfg.decoy_class,
@@ -700,14 +850,30 @@ def write_report(cfg: Config, poi_desc: Descriptor, stats: RunStats, pool_size: 
         "soft_constraints": cfg.property_tolerances,
         "objective_weights": cfg.weights.__dict__,
         "annealing_settings": cfg.anneal.__dict__,
-        "requested_generated_selected": {"requested": cfg.n, "pool_valid": pool_size, "selected": selected},
+        "requested_generated_selected": {
+            "requested": cfg.n,
+            "target_pool": stats.target_pool_expected,
+            "pool_valid": pool_size,
+            "selected": selected,
+        },
         "rejection_reasons": stats.rejections,
-        "soft_tolerance_breakdown": soft_breakdown,
+        "total_hard_failures": stats.total_hard_failures,
+        "total_soft_failures": stats.total_soft_failures,
+        "hard_failure_breakdown": build_breakdown(hard_counts, stats.total_proposals_generated),
+        "soft_failure_breakdown": build_breakdown(soft_counts, stats.total_proposals_generated),
+        "soft_tolerance_breakdown": soft_breakdown_legacy,
+        "soft_tolerance_count_definition": {
+            "soft_tolerance": "counts sequences rejected by soft tolerance (sequence-level)",
+            "soft_tolerance_<descriptor>": "counts descriptor-level tolerance failures; one sequence can increment multiple descriptors",
+        },
+        "sampling_summary": sampling_summary,
         "partial": partial,
         "failed": failed,
         "relaxation_used": stats.relax_log,
         "final_diversity_summary": diversity,
         "timings": stats.timings,
+        "written_files": stats.written_files,
+        "accepted_sequences_summary": accepted_sequences_summary(decoys),
     }
     with open(cfg.run_report_json, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
@@ -724,6 +890,7 @@ def generate_decoys(cfg: Config, seed: int, stats: RunStats) -> Tuple[List[Decoy
     pool: List[DecoyResult] = []
     seen: Set[str] = set()
     target_pool = cfg.n * cfg.oversample_factor
+    stats.target_pool_expected = target_pool
     stage_max = cfg.max_relax_stage if cfg.relaxation else 0
 
     for stage in range(stage_max + 1):
@@ -739,6 +906,7 @@ def generate_decoys(cfg: Config, seed: int, stats: RunStats) -> Tuple[List[Decoy
             cand = anneal_one(cfg.poi, poi_desc, cfg, one_seed, mode_meta, stage, stats, seen)
             if cand:
                 pool.append(cand)
+                stats.total_pool_admissions += 1
                 seen.add(cand.sequence)
                 if len(pool) % cfg.progress_every == 0:
                     print(f"[pepctrl] progress valid_pool={len(pool)}/{target_pool} stage={stage}")
@@ -750,7 +918,9 @@ def generate_decoys(cfg: Config, seed: int, stats: RunStats) -> Tuple[List[Decoy
     chosen, diversity = select_diverse(pool, cfg.n, cfg.max_identity_between_decoys)
     partial = len(chosen) < cfg.n
     failed = partial and not cfg.allow_partial
+    stats.pool_valid_achieved = len(pool)
     stats.selected_final = len(chosen)
+    stats.total_duplicate_rejections += diversity.get("rejected_by_diversity_filter", 0)
     return chosen, diversity, partial, failed, len(pool)
 
 
@@ -793,11 +963,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         t1 = time.perf_counter()
         decoys, diversity, partial, failed, pool_size = generate_decoys(cfg, seed, stats)
         stats.timings["generate_s"] = time.perf_counter() - t1
+        poi_desc = describe(cfg.poi, cfg)
         t2 = time.perf_counter()
-        write_decoys(decoys, cfg.poi, describe(cfg.poi, cfg), cfg)
+        write_decoys(decoys, cfg.poi, poi_desc, cfg, stats)
         stats.timings["write_s"] = time.perf_counter() - t2
         stats.timings["total_s"] = time.perf_counter() - t0
-        write_report(cfg, describe(cfg.poi, cfg), stats, pool_size, len(decoys), diversity, partial, failed, seed)
+        if cfg.run_report_json:
+            stats.written_files.append({
+                "path": cfg.run_report_json,
+                "kind": "run_report_json",
+                "format": "json",
+                "description": "reporte de ejecución con métricas de muestreo, rechazos y resumen final",
+            })
+        write_report(cfg, poi_desc, stats, pool_size, len(decoys), diversity, partial, failed, seed, decoys)
+        print_stdout_summary(cfg, stats, poi_desc, decoys, partial, failed, seed)
         if failed:
             print(f"[pepctrl] partial failure: requested={cfg.n} selected={len(decoys)} allow with --allow-partial")
             return 2
