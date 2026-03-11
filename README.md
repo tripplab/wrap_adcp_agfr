@@ -143,7 +143,7 @@ python3 tools_generate_run_manifests.py \
 ### Notes
 - Replica defaults are read from `defaults.replicas` (for example `planned_count_default`, `index_start`, `suffix_width`, `seed_base`) with compatibility fallbacks for older layouts.
 - Config defaults support both `defaults.config.<key>` and legacy `defaults.<key>` fields.
-- The script does not validate physical existence of every referenced receptor file.
+- The script validates that every `receptor_pdb_file` referenced by `proteins.csv` exists as a file under `<exp_dir>/<inputs_dir>/receptors` and exits early with a detailed error if any are missing.
 - Campaign count equals `N_proteins × N_peptides`.
 
 ---
