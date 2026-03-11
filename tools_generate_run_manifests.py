@@ -87,13 +87,32 @@ def main(argv=None):
     peptides = read_csv(peptides_csv)
 
     expm = json.loads(exp_manifest_json.read_text(encoding="utf-8"))
+    inputs_dir = Path(expm.get("inputs_dir", "inputs"))
+    receptors_dir = exp_dir / inputs_dir / "receptors"
+
+    missing_receptor_files = []
+    for p in proteins:
+        protein_id = p.get("protein_id", "").strip() or "<unknown_protein_id>"
+        receptor_pdb_file = p.get("receptor_pdb_file", "").strip()
+        receptor_path = receptors_dir / receptor_pdb_file
+        if not receptor_pdb_file or not receptor_path.is_file():
+            missing_receptor_files.append((protein_id, receptor_pdb_file, receptor_path))
+
+    if missing_receptor_files:
+        details = "\n".join(
+            f"- protein_id={protein_id}, receptor_pdb_file={receptor_pdb_file or '<empty>'}, expected_path={path}"
+            for protein_id, receptor_pdb_file, path in missing_receptor_files
+        )
+        raise SystemExit(
+            "Missing receptor file(s) referenced in proteins CSV:\n"
+            f"{details}"
+        )
+
     experiment_id = expm.get("experiment_id", "expXXX")
     layout_version = expm.get("layout_version", "1.0")
     defaults = expm.get("defaults", {}) or {}
     defaults_config = defaults.get("config", {}) if isinstance(defaults.get("config", {}), dict) else {}
     defaults_replicas = defaults.get("replicas", {}) if isinstance(defaults.get("replicas", {}), dict) else {}
-    inputs_dir = Path(expm.get("inputs_dir", "inputs"))
-    receptors_dir = exp_dir / inputs_dir / "receptors"
 
     default_reps = pick_first(
         defaults_replicas.get("planned_count_default"),
