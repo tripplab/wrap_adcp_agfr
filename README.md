@@ -115,10 +115,34 @@ Global output:
 
 ### Usage
 ```bash
+# Show CLI help
+python3 tools_generate_run_manifests.py -h
+
+# Run with defaults (expects inputs in current directory)
 python3 tools_generate_run_manifests.py
+
+# Run using a specific experiment root and custom paths
+python3 tools_generate_run_manifests.py \
+  --exp-dir /path/to/experiment \
+  --proteins-csv proteins.csv \
+  --peptides-csv peptides.csv \
+  --experiment-manifest experiment_manifest.json \
+  --runs-root runs \
+  --analysis-dir analysis
 ```
 
+### CLI options (summary)
+- `--exp-dir`: experiment root directory (default: current directory)
+- `--proteins-csv`: proteins table path (default: `proteins.csv`)
+- `--peptides-csv`: peptides table path (default: `peptides.csv`)
+- `--experiment-manifest`: manifest JSON path (default: `experiment_manifest.json`)
+- `--runs-root`: runs output directory (default: `runs`)
+- `--analysis-dir`: analysis output directory (default: `analysis`)
+- `--matrix-csv`: campaign matrix filename inside analysis dir (default: `campaigns_matrix.csv`)
+
 ### Notes
+- Replica defaults are read from `defaults.replicas` (for example `planned_count_default`, `index_start`, `suffix_width`, `seed_base`) with compatibility fallbacks for older layouts.
+- Config defaults support both `defaults.config.<key>` and legacy `defaults.<key>` fields.
 - The script does not validate physical existence of every referenced receptor file.
 - Campaign count equals `N_proteins × N_peptides`.
 
