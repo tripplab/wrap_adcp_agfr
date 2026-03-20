@@ -717,6 +717,36 @@ PHASE2_GLOBAL_RANK_FIELDS = [
     "fail_rate_poi", "fail_rate_controls_median", "verdict",
 ]
 
+SET_SUMMARY_FIELDS = [
+    "protein_id", "peptide_set",
+    "n_peptides_detected", "n_peptides_used", "n_replicas_used",
+    "member_peptides", "flag_low_n_set",
+    "Eint_seq_median", "Eint_seq_IQR", "Eint_seq_mean", "Eint_seq_std",
+    "Eint_raw_median", "Eint_raw_IQR", "Eint_raw_mean", "Eint_raw_std",
+    "f1_seq_median", "f1_seq_IQR", "Neff_seq_median", "Neff_seq_IQR",
+    "f1_raw_pool", "Neff_raw_pool",
+]
+
+PROTEIN_SET_DISCRIMINATION_FIELDS = [
+    "protein_id", "poi_id", "control_set",
+    "n_poi_replicas", "n_control_peptides", "n_control_replicas_total",
+    "poi_Eint_seq_summary", "control_Eint_seq_median", "control_Eint_seq_IQR", "delta_seq_median",
+    "poi_rank_among_control_seq", "poi_percentile_in_control_seq", "auc_seq", "p_empirical_seq",
+    "poi_f1", "control_f1_seq_median", "delta_f1_seq",
+    "poi_Neff", "control_Neff_seq_median", "delta_Neff_seq",
+    "n_poi_replicas_raw", "n_control_replicas_raw",
+    "poi_raw_median", "control_raw_median", "delta_raw_median",
+    "auc_raw", "cliffs_delta_raw", "p_mwu_raw", "q_fdr_raw", "p_perm_raw",
+    "delta_f1_rawpool", "delta_Neff_rawpool",
+    "flag_low_n_set", "flag_skipped",
+]
+
+PROTEIN_SET_RANK_FIELDS = [
+    "protein_id", "best_control_set", "primary_percentile", "primary_empirical_p",
+    "secondary_auc_raw", "secondary_q_fdr_raw", "delta_f1_seq", "delta_f1_rawpool",
+    "verdict_set_level",
+]
+
 SCORE_SYNONYMS = ["winner_omm_dE_interaction", "winner_omm_de_interaction", "winner_omm_deint", "winner_eint"]
 CLUSTER_SYNONYMS = ["winner_cluster_mode_id", "winner_cluster_id", "cluster_mode_id"]
 QA_SYNONYMS = ["qa_status", "status"]
@@ -731,6 +761,17 @@ VERDICT_THRESHOLDS = {
     "poi_fail_rate_max": 0.2,
     "polya_auc_confounded": 0.3,
     "confounded_delta_median": 5.0,
+}
+
+SET_VERDICT_THRESHOLDS = {
+    "strong_percentile": 0.8,
+    "moderate_percentile": 0.65,
+    "strong_empirical_p": 0.1,
+    "moderate_empirical_p": 0.25,
+    "strong_auc_raw": 0.8,
+    "moderate_auc_raw": 0.7,
+    "strong_delta_f1": 0.2,
+    "moderate_delta_f1": 0.1,
 }
 
 
@@ -829,6 +870,78 @@ def _perm_pvalue_delta_median(poi, ctrl, n_perm: int, rng) -> float:
     return (cnt + 1.0) / (n_perm + 1.0)
 
 
+def _cluster_metrics_from_values(values) -> Tuple[float, float]:
+    np, _, _ = _import_phase2_deps()
+    arr = np.asarray(values)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    vals, cnts = np.unique(arr.astype(int), return_counts=True)
+    if cnts.size == 0:
+        return float("nan"), float("nan")
+    f1 = float(cnts.max() / cnts.sum())
+    probs = cnts / cnts.sum()
+    h = float(-np.sum(probs * np.log(probs)))
+    neff = float(np.exp(h))
+    return f1, neff
+
+
+def _prefer_exact_poi_set(peptide_set: str, poi_id: str) -> bool:
+    normalized = str(peptide_set or "").strip().lower()
+    return normalized == str(poi_id).strip().lower()
+
+
+def _control_set_priority(peptide_set: str) -> Tuple[int, str]:
+    name = str(peptide_set or "")
+    lname = name.lower()
+    if "matched" in lname:
+        return (0, lname)
+    if "decoy" in lname:
+        return (1, lname)
+    return (2, lname)
+
+
+def _load_peptide_metadata(exp_root: Path, poi_id: str):
+    _, pd, _ = _import_phase2_deps()
+    peptides_csv = exp_root / "peptides.csv"
+    if not peptides_csv.exists():
+        raise FileNotFoundError(
+            f"Set-level analysis requires metadata file: {peptides_csv}. "
+            "Expected columns include peptide_id and peptide_set."
+        )
+    meta = pd.read_csv(peptides_csv)
+    required = ["peptide_id", "peptide_set"]
+    missing = [c for c in required if c not in meta.columns]
+    if missing:
+        raise ValueError(f"peptides.csv missing required columns: {missing}; available={list(meta.columns)}")
+    meta["peptide_id"] = meta["peptide_id"].astype(str)
+    meta["peptide_set"] = meta["peptide_set"].astype(str)
+
+    dup = (
+        meta[["peptide_id", "peptide_set"]]
+        .drop_duplicates()
+        .groupby("peptide_id")["peptide_set"]
+        .nunique()
+    )
+    bad = dup[dup > 1]
+    if not bad.empty:
+        offenders = sorted(bad.index.tolist())
+        raise ValueError(
+            "Inconsistent peptide_id -> peptide_set mapping in peptides.csv for: "
+            + ", ".join(offenders[:10])
+            + (" ..." if len(offenders) > 10 else "")
+        )
+
+    mapping = (
+        meta[["peptide_id", "peptide_set"]]
+        .drop_duplicates(subset=["peptide_id"])
+        .set_index("peptide_id")["peptide_set"]
+        .to_dict()
+    )
+    poi_metadata_ids = sorted(meta.loc[meta["peptide_set"].map(lambda s: _prefer_exact_poi_set(s, poi_id)), "peptide_id"].unique().tolist())
+    return peptides_csv, meta, mapping, poi_metadata_ids
+
+
 def run_phase2_from_replicas_csv(
     replicas_csv: Path,
     outdir: Path,
@@ -846,6 +959,8 @@ def run_phase2_from_replicas_csv(
     n_perm: int,
     seed: Optional[int],
     exp_root: Path,
+    min_set_peptides: int,
+    min_set_replicas: int,
     verbose: int = 0,
 ) -> None:
     if not run_phase2:
@@ -880,6 +995,8 @@ def run_phase2_from_replicas_csv(
     skipped_legacy_groups = sorted(df.loc[df["_excluded_reason"] == "legacy", "peptide_id"].dropna().unique().tolist())
 
     group_rows = []
+    set_warnings: List[str] = []
+    peptides_csv, peptide_meta, peptide_to_set, poi_metadata_ids = _load_peptide_metadata(exp_root, poi_id)
     grouped = df.groupby(["protein_id", "peptide_id"], sort=True, dropna=False)
     for (protein_id, peptide_id), g in grouped:
         n_detected = int(len(g))
@@ -937,6 +1054,83 @@ def run_phase2_from_replicas_csv(
 
     group_summary = pd.DataFrame(group_rows, columns=PHASE2_GROUP_SUMMARY_FIELDS)
     group_summary.to_csv(outdir / "group_summary.csv", index=False) #, float_format="%.2f")
+
+    # Set-level analysis uses metadata from peptides.csv and keeps the existing
+    # peptide-level outputs unchanged. The primary analysis is sequence-balanced:
+    # each control peptide contributes one summary statistic so large control sets
+    # do not dominate solely because they contain more raw replicas.
+    df_nonlegacy = df[~df["peptide_id"].astype(str).str.endswith(exclude_peptide_suffix)].copy()
+    df_nonlegacy["_peptide_set"] = df_nonlegacy["peptide_id"].map(peptide_to_set)
+    missing_meta_ids = sorted(
+        df_nonlegacy.loc[df_nonlegacy["_peptide_set"].isna(), "peptide_id"].dropna().astype(str).unique().tolist()
+    )
+    if missing_meta_ids:
+        set_warnings.append(
+            "Excluded from set-level analysis due to missing peptides.csv metadata: "
+            + ", ".join(missing_meta_ids[:20])
+            + (" ..." if len(missing_meta_ids) > 20 else "")
+        )
+    df_set = df_nonlegacy[df_nonlegacy["_peptide_set"].notna()].copy()
+    df_set["_peptide_set"] = df_set["_peptide_set"].astype(str)
+    df_set_used = df_set[df_set["_used"]].copy()
+
+    peptide_summary = group_summary.copy()
+    peptide_summary = peptide_summary[~peptide_summary["peptide_id"].astype(str).str.endswith(exclude_peptide_suffix)].copy()
+    peptide_summary["_peptide_set"] = peptide_summary["peptide_id"].map(peptide_to_set)
+    peptide_summary = peptide_summary[peptide_summary["_peptide_set"].notna()].copy()
+
+    set_rows = []
+    if not df_set.empty:
+        detected = (
+            df_set.groupby(["protein_id", "_peptide_set"])["peptide_id"]
+            .agg(lambda s: sorted(set(map(str, s.dropna().tolist()))))
+            .to_dict()
+        )
+        used_members = (
+            df_set_used.groupby(["protein_id", "_peptide_set"])["peptide_id"]
+            .agg(lambda s: sorted(set(map(str, s.dropna().tolist()))))
+            .to_dict()
+        )
+        for key_tuple in sorted(detected.keys()):
+            protein_id, peptide_set = key_tuple
+            detected_peptides = detected.get(key_tuple, [])
+            used_peptides = used_members.get(key_tuple, [])
+            pep_sub = peptide_summary[
+                (peptide_summary["protein_id"] == protein_id) & (peptide_summary["_peptide_set"] == peptide_set)
+            ].copy()
+            pep_sub = pep_sub.sort_values("peptide_id")
+            raw_sub = df_set_used[(df_set_used["protein_id"] == protein_id) & (df_set_used["_peptide_set"] == peptide_set)].copy()
+            seq_e = pep_sub["Eint_median"].dropna().astype(float).to_numpy()
+            raw_e = raw_sub[score_col].dropna().astype(float).to_numpy()
+            seq_f1 = pep_sub["f1_cluster"].dropna().astype(float).to_numpy()
+            seq_neff = pep_sub["Neff_cluster"].dropna().astype(float).to_numpy()
+            pool_f1, pool_neff = _cluster_metrics_from_values(raw_sub[cluster_col].dropna().astype(float).to_numpy())
+            low_n_set = (len(used_peptides) < min_set_peptides) or (len(raw_sub) < min_set_replicas)
+            set_rows.append({
+                "protein_id": protein_id,
+                "peptide_set": peptide_set,
+                "n_peptides_detected": len(detected_peptides),
+                "n_peptides_used": len(used_peptides),
+                "n_replicas_used": int(len(raw_sub)),
+                "member_peptides": ";".join(used_peptides),
+                "flag_low_n_set": bool(low_n_set),
+                "Eint_seq_median": float(np.median(seq_e)) if len(seq_e) else np.nan,
+                "Eint_seq_IQR": float(np.percentile(seq_e, 75) - np.percentile(seq_e, 25)) if len(seq_e) else np.nan,
+                "Eint_seq_mean": float(np.mean(seq_e)) if len(seq_e) else np.nan,
+                "Eint_seq_std": float(np.std(seq_e, ddof=1)) if len(seq_e) > 1 else np.nan,
+                "Eint_raw_median": float(np.median(raw_e)) if len(raw_e) else np.nan,
+                "Eint_raw_IQR": float(np.percentile(raw_e, 75) - np.percentile(raw_e, 25)) if len(raw_e) else np.nan,
+                "Eint_raw_mean": float(np.mean(raw_e)) if len(raw_e) else np.nan,
+                "Eint_raw_std": float(np.std(raw_e, ddof=1)) if len(raw_e) > 1 else np.nan,
+                "f1_seq_median": float(np.median(seq_f1)) if len(seq_f1) else np.nan,
+                "f1_seq_IQR": float(np.percentile(seq_f1, 75) - np.percentile(seq_f1, 25)) if len(seq_f1) else np.nan,
+                "Neff_seq_median": float(np.median(seq_neff)) if len(seq_neff) else np.nan,
+                "Neff_seq_IQR": float(np.percentile(seq_neff, 75) - np.percentile(seq_neff, 25)) if len(seq_neff) else np.nan,
+                "f1_raw_pool": pool_f1,
+                "Neff_raw_pool": pool_neff,
+            })
+    set_summary = pd.DataFrame(set_rows, columns=SET_SUMMARY_FIELDS)
+    set_summary.to_csv(outdir / "set_summary.csv", index=False)
 
     gidx = {(r["protein_id"], r["peptide_id"]): r for r in group_rows}
     discr_rows = []
@@ -1003,6 +1197,194 @@ def run_phase2_from_replicas_csv(
             out_pieces.append(sub)
         discr_df = pd.concat(out_pieces, ignore_index=True)
     discr_df.to_csv(outdir / "protein_discrimination.csv", index=False) #, float_format="%.2f")
+
+    set_discr_rows = []
+    set_lookup = {}
+    if not set_summary.empty:
+        set_lookup = {
+            (str(r["protein_id"]), str(r["peptide_set"])): r
+            for _, r in set_summary.iterrows()
+        }
+
+    for protein_id, gp in df_set.groupby("protein_id", sort=True):
+        gp_used = gp[gp["_used"]].copy()
+        poi_candidates = gp_used[gp_used["peptide_id"] == poi_id]["peptide_id"].dropna().astype(str).unique().tolist()
+        if not poi_candidates:
+            if poi_metadata_ids:
+                poi_candidates = [p for p in poi_metadata_ids if p in gp_used["peptide_id"].astype(str).unique().tolist()]
+        if not poi_candidates:
+            continue
+        poi_peptide_id = sorted(poi_candidates)[0]
+        poi_raw = gp_used[gp_used["peptide_id"] == poi_peptide_id][score_col].dropna().astype(float).to_numpy()
+        poi_clusters = gp_used[gp_used["peptide_id"] == poi_peptide_id][cluster_col].dropna().astype(float).to_numpy()
+        if len(poi_raw) == 0:
+            continue
+        poi_summary_row = gidx.get((protein_id, poi_peptide_id), {})
+        poi_seq_summary = float(np.median(poi_raw))
+        poi_f1 = float(poi_summary_row.get("f1_cluster", np.nan))
+        poi_neff = float(poi_summary_row.get("Neff_cluster", np.nan))
+
+        sets_present = sorted(gp["_peptide_set"].dropna().astype(str).unique().tolist())
+        for control_set in sets_present:
+            control_members = gp_used[(gp_used["_peptide_set"] == control_set) & (gp_used["peptide_id"] != poi_peptide_id)].copy()
+            control_peptides = sorted(control_members["peptide_id"].dropna().astype(str).unique().tolist())
+            set_info = set_lookup.get((protein_id, control_set), {})
+            low_n_set = bool(
+                (len(control_peptides) < min_set_peptides) or (len(control_members) < min_set_replicas)
+            )
+            skipped = bool(len(control_peptides) == 0 or len(control_members) == 0)
+            base = {
+                "protein_id": protein_id,
+                "poi_id": poi_peptide_id,
+                "control_set": control_set,
+                "n_poi_replicas": int(len(poi_raw)),
+                "n_control_peptides": int(len(control_peptides)),
+                "n_control_replicas_total": int(len(control_members)),
+                "poi_Eint_seq_summary": poi_seq_summary,
+                "control_Eint_seq_median": np.nan,
+                "control_Eint_seq_IQR": np.nan,
+                "delta_seq_median": np.nan,
+                "poi_rank_among_control_seq": np.nan,
+                "poi_percentile_in_control_seq": np.nan,
+                "auc_seq": np.nan,
+                "p_empirical_seq": np.nan,
+                "poi_f1": poi_f1,
+                "control_f1_seq_median": np.nan,
+                "delta_f1_seq": np.nan,
+                "poi_Neff": poi_neff,
+                "control_Neff_seq_median": np.nan,
+                "delta_Neff_seq": np.nan,
+                "n_poi_replicas_raw": int(len(poi_raw)),
+                "n_control_replicas_raw": int(len(control_members)),
+                "poi_raw_median": float(np.median(poi_raw)) if len(poi_raw) else np.nan,
+                "control_raw_median": float(np.median(control_members[score_col].dropna().astype(float))) if len(control_members) else np.nan,
+                "delta_raw_median": np.nan,
+                "auc_raw": np.nan,
+                "cliffs_delta_raw": np.nan,
+                "p_mwu_raw": np.nan,
+                "q_fdr_raw": np.nan,
+                "p_perm_raw": np.nan,
+                "delta_f1_rawpool": np.nan,
+                "delta_Neff_rawpool": np.nan,
+                "flag_low_n_set": low_n_set,
+                "flag_skipped": skipped,
+            }
+            if skipped:
+                set_discr_rows.append(base)
+                continue
+            control_seq = (
+                peptide_summary[
+                    (peptide_summary["protein_id"] == protein_id)
+                    & (peptide_summary["_peptide_set"] == control_set)
+                    & (peptide_summary["peptide_id"] != poi_peptide_id)
+                ]
+                .copy()
+                .sort_values("peptide_id")
+            )
+            control_seq_vals = control_seq["Eint_median"].dropna().astype(float).to_numpy()
+            control_seq_f1 = control_seq["f1_cluster"].dropna().astype(float).to_numpy()
+            control_seq_neff = control_seq["Neff_cluster"].dropna().astype(float).to_numpy()
+            control_raw = control_members[score_col].dropna().astype(float).to_numpy()
+            if len(control_seq_vals):
+                n_better_or_equal = int(np.sum(control_seq_vals >= poi_seq_summary))
+                n_strict_better = int(np.sum(control_seq_vals < poi_seq_summary))
+                percentile_seq = float(n_better_or_equal / len(control_seq_vals))
+                base["control_Eint_seq_median"] = float(np.median(control_seq_vals))
+                base["control_Eint_seq_IQR"] = float(np.percentile(control_seq_vals, 75) - np.percentile(control_seq_vals, 25))
+                base["delta_seq_median"] = float(poi_seq_summary - np.median(control_seq_vals))
+                base["poi_rank_among_control_seq"] = int(n_strict_better + 1)
+                base["poi_percentile_in_control_seq"] = percentile_seq
+                base["auc_seq"] = percentile_seq
+                base["p_empirical_seq"] = float((np.sum(control_seq_vals <= poi_seq_summary) + 1.0) / (len(control_seq_vals) + 1.0))
+                base["control_f1_seq_median"] = float(np.median(control_seq_f1)) if len(control_seq_f1) else np.nan
+                base["delta_f1_seq"] = float(poi_f1 - np.median(control_seq_f1)) if len(control_seq_f1) and math.isfinite(poi_f1) else np.nan
+                base["control_Neff_seq_median"] = float(np.median(control_seq_neff)) if len(control_seq_neff) else np.nan
+                base["delta_Neff_seq"] = float(poi_neff - np.median(control_seq_neff)) if len(control_seq_neff) and math.isfinite(poi_neff) else np.nan
+            if len(control_raw):
+                base["delta_raw_median"] = float(np.median(poi_raw) - np.median(control_raw))
+                mwu = mannwhitneyu(poi_raw, control_raw, alternative="two-sided", method="auto")
+                _, auc_raw, cliffs_raw = _compute_auc_and_cliffs(poi_raw, control_raw)
+                base["auc_raw"] = float(auc_raw)
+                base["cliffs_delta_raw"] = float(cliffs_raw)
+                base["p_mwu_raw"] = float(mwu.pvalue)
+                if permutation_tests:
+                    base["p_perm_raw"] = float(_perm_pvalue_delta_median(poi_raw, control_raw, n_perm=n_perm, rng=rng))
+                control_pool_f1 = _as_float(set_info.get("f1_raw_pool", np.nan))
+                control_pool_neff = _as_float(set_info.get("Neff_raw_pool", np.nan))
+                if math.isfinite(control_pool_f1) and math.isfinite(poi_f1):
+                    base["delta_f1_rawpool"] = float(poi_f1 - control_pool_f1)
+                if math.isfinite(control_pool_neff) and math.isfinite(poi_neff):
+                    base["delta_Neff_rawpool"] = float(poi_neff - control_pool_neff)
+            set_discr_rows.append(base)
+
+    set_discr_df = pd.DataFrame(set_discr_rows, columns=PROTEIN_SET_DISCRIMINATION_FIELDS)
+    if not set_discr_df.empty:
+        pieces = []
+        for protein_id, sub in set_discr_df.groupby("protein_id", sort=True):
+            sub = sub.copy()
+            mask = sub["p_mwu_raw"].notna()
+            if mask.any():
+                sub.loc[mask, "q_fdr_raw"] = _bh_fdr(sub.loc[mask, "p_mwu_raw"].astype(float).tolist())
+            pieces.append(sub)
+        set_discr_df = pd.concat(pieces, ignore_index=True)
+    set_discr_df.to_csv(outdir / "protein_set_discrimination.csv", index=False)
+
+    set_rank_rows = []
+    for protein_id, sub in set_discr_df.groupby("protein_id", sort=True):
+        sub2 = sub[sub["flag_skipped"] == False].copy()
+        if sub2.empty:
+            continue
+        sub2["_priority"] = sub2["control_set"].map(lambda s: _control_set_priority(str(s))[0])
+        sub2["_primary_p"] = pd.to_numeric(sub2["p_empirical_seq"], errors="coerce").fillna(1.0)
+        sub2["_secondary_q"] = pd.to_numeric(sub2["q_fdr_raw"], errors="coerce").fillna(1.0)
+        sub2["_percentile_sort"] = pd.to_numeric(sub2["poi_percentile_in_control_seq"], errors="coerce").fillna(-1.0)
+        best = sub2.sort_values(
+            ["_priority", "_primary_p", "_secondary_q", "_percentile_sort"],
+            ascending=[True, True, True, False],
+        ).iloc[0]
+        primary_percentile = float(best["poi_percentile_in_control_seq"]) if pd.notna(best["poi_percentile_in_control_seq"]) else np.nan
+        primary_empirical_p = float(best["p_empirical_seq"]) if pd.notna(best["p_empirical_seq"]) else np.nan
+        secondary_auc_raw = float(best["auc_raw"]) if pd.notna(best["auc_raw"]) else np.nan
+        secondary_q_fdr_raw = float(best["q_fdr_raw"]) if pd.notna(best["q_fdr_raw"]) else np.nan
+        delta_f1_seq = float(best["delta_f1_seq"]) if pd.notna(best["delta_f1_seq"]) else np.nan
+        delta_f1_rawpool = float(best["delta_f1_rawpool"]) if pd.notna(best["delta_f1_rawpool"]) else np.nan
+        verdict = "WEAK_SET_SIGNAL"
+        if bool(best.get("flag_low_n_set", False)):
+            verdict = "CONFOUNDED_SET_SIGNAL"
+        elif (
+            math.isfinite(primary_percentile) and primary_percentile >= SET_VERDICT_THRESHOLDS["strong_percentile"]
+            and math.isfinite(primary_empirical_p) and primary_empirical_p <= SET_VERDICT_THRESHOLDS["strong_empirical_p"]
+            and math.isfinite(secondary_auc_raw) and secondary_auc_raw >= SET_VERDICT_THRESHOLDS["strong_auc_raw"]
+            and math.isfinite(delta_f1_seq) and delta_f1_seq >= SET_VERDICT_THRESHOLDS["strong_delta_f1"]
+        ):
+            verdict = "STRONG_SET_SIGNAL"
+        elif (
+            math.isfinite(primary_percentile) and primary_percentile >= SET_VERDICT_THRESHOLDS["moderate_percentile"]
+            and math.isfinite(primary_empirical_p) and primary_empirical_p <= SET_VERDICT_THRESHOLDS["moderate_empirical_p"]
+            and (
+                (math.isfinite(secondary_auc_raw) and secondary_auc_raw >= SET_VERDICT_THRESHOLDS["moderate_auc_raw"])
+                or (math.isfinite(delta_f1_seq) and delta_f1_seq >= SET_VERDICT_THRESHOLDS["moderate_delta_f1"])
+            )
+        ):
+            verdict = "MODERATE_SET_SIGNAL"
+        elif (
+            (math.isfinite(secondary_q_fdr_raw) and secondary_q_fdr_raw < alpha and math.isfinite(primary_percentile) and primary_percentile < 0.5)
+            or (math.isfinite(delta_f1_seq) and delta_f1_seq < 0)
+        ):
+            verdict = "CONFOUNDED_SET_SIGNAL"
+        set_rank_rows.append({
+            "protein_id": protein_id,
+            "best_control_set": best["control_set"],
+            "primary_percentile": primary_percentile,
+            "primary_empirical_p": primary_empirical_p,
+            "secondary_auc_raw": secondary_auc_raw,
+            "secondary_q_fdr_raw": secondary_q_fdr_raw,
+            "delta_f1_seq": delta_f1_seq,
+            "delta_f1_rawpool": delta_f1_rawpool,
+            "verdict_set_level": verdict,
+        })
+    set_rank_df = pd.DataFrame(set_rank_rows, columns=PROTEIN_SET_RANK_FIELDS)
+    set_rank_df.to_csv(outdir / "protein_set_rank.csv", index=False)
 
     global_rows = []
     for protein_id, sub in discr_df.groupby("protein_id", sort=True):
@@ -1072,6 +1454,8 @@ def run_phase2_from_replicas_csv(
     lines.append(f"- timestamp: `{now_iso()}`")
     lines.append(f"- poi_id: `{poi_id}`")
     lines.append(f"- min_replicas: `{min_replicas}`")
+    lines.append(f"- min_set_peptides: `{min_set_peptides}`")
+    lines.append(f"- min_set_replicas: `{min_set_replicas}`")
     lines.append(f"- allow_low_n_comparisons: `{allow_low_n_comparisons}`")
     lines.append(f"- alpha: `{alpha}`")
     lines.append(f"- fdr_method: `{fdr_method}`")
@@ -1080,6 +1464,25 @@ def run_phase2_from_replicas_csv(
         lines.append(f"- n_perm: `{n_perm}`")
         lines.append(f"- seed: `{seed}`")
     lines.append("")
+    lines.append("## Set-level analysis summary")
+    lines.append("")
+    lines.append(f"- peptides.csv: `{peptides_csv}`")
+    lines.append(f"- POI metadata candidates from peptide_set=={poi_id!r}: {', '.join(poi_metadata_ids) if poi_metadata_ids else 'none'}")
+    lines.append(f"- set rows: `{len(set_summary)}`; protein-set comparisons: `{len(set_discr_df)}`; ranked proteins: `{len(set_rank_df)}`")
+    if missing_meta_ids:
+        lines.append(f"- Missing peptide_set metadata excluded from set-level analysis: {', '.join(missing_meta_ids)}")
+    if set_warnings:
+        for warning in set_warnings:
+            lines.append(f"- WARNING: {warning}")
+    lines.append("")
+    if not set_summary.empty:
+        lines.append("| protein_id | peptide_set | n_peptides_detected | n_peptides_used | n_replicas_used | flag_low_n_set | member_peptides |")
+        lines.append("|---|---|---:|---:|---:|---:|---|")
+        for _, r in set_summary.sort_values(["protein_id", "peptide_set"]).iterrows():
+            lines.append(
+                f"| {r['protein_id']} | {r['peptide_set']} | {int(r['n_peptides_detected'])} | {int(r['n_peptides_used'])} | {int(r['n_replicas_used'])} | {bool(r['flag_low_n_set'])} | {r['member_peptides']} |"
+            )
+        lines.append("")
 
     lines.append("## Data coverage")
     lines.append("")
@@ -1120,6 +1523,31 @@ def run_phase2_from_replicas_csv(
             lines.append(f"- Best candidate control: `{gv['best_control_type']}`; verdict: **{gv['verdict']}**")
 
     lines.append("")
+    lines.append("## Set-level analysis")
+    lines.append("")
+    lines.append("Primary set-level analysis is sequence-balanced: each control peptide contributes one median winner_omm_dE_interaction value, which prevents large pooled control sets from dominating by raw replica count alone.")
+    lines.append("Secondary set-level analysis pools raw replicas across the control set for a higher-power but potentially control-heavy sensitivity view.")
+    for protein_id in sorted(set_discr_df["protein_id"].dropna().astype(str).unique().tolist()) if not set_discr_df.empty else []:
+        lines.append("")
+        lines.append(f"### {protein_id}")
+        sub = set_discr_df[set_discr_df["protein_id"] == protein_id].copy()
+        sub["_priority"] = sub["control_set"].map(lambda s: _control_set_priority(str(s))[0])
+        sub = sub.sort_values(["_priority", "p_empirical_seq", "q_fdr_raw"], ascending=[True, True, True])
+        lines.append("| control_set | n_control_peptides | n_control_replicas_total | poi_Eint_seq_summary | control_Eint_seq_median | control_Eint_seq_IQR | poi_percentile_in_control_seq | p_empirical_seq | delta_f1_seq | auc_raw | q_fdr_raw | delta_f1_rawpool | skipped |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for _, r in sub.iterrows():
+            lines.append(
+                f"| {r['control_set']} | {int(r['n_control_peptides'])} | {int(r['n_control_replicas_total'])} | {r['poi_Eint_seq_summary']:.3f} | {r['control_Eint_seq_median']:.3f} | {r['control_Eint_seq_IQR']:.3f} | {r['poi_percentile_in_control_seq']:.3f} | {r['p_empirical_seq']:.3g} | {r['delta_f1_seq']:.3f} | {r['auc_raw']:.3f} | {r['q_fdr_raw']:.3g} | {r['delta_f1_rawpool']:.3f} | {bool(r['flag_skipped'])} |"
+            )
+        rv = set_rank_df[set_rank_df["protein_id"] == protein_id]
+        if not rv.empty:
+            rr = rv.iloc[0]
+            lines.append(
+                f"- Best set-level comparison: `{rr['best_control_set']}`; verdict: **{rr['verdict_set_level']}** "
+                f"(primary_percentile={rr['primary_percentile']:.3f}, primary_empirical_p={rr['primary_empirical_p']:.3g}, secondary_auc_raw={rr['secondary_auc_raw']:.3f}, secondary_q_fdr_raw={rr['secondary_q_fdr_raw']:.3g})."
+            )
+
+    lines.append("")
     lines.append("## QA exclusions")
     excl = df["_excluded_reason"].value_counts().to_dict()
     lines.append(f"- openmm_missing: {int(excl.get('openmm_missing', 0))}")
@@ -1136,6 +1564,8 @@ def run_phase2_from_replicas_csv(
     lines.append("")
     lines.append("## Interpretation note")
     lines.append("These metrics are protocol-discrimination diagnostics and are **not** binding free energies (not ΔG estimates).")
+    lines.append("Set-level primary percentile values are reported on a 0-1 scale, where larger values mean the POI is more favorable (more negative/better) than a larger fraction of control-sequence medians.")
+    lines.append("The primary set-level p_empirical_seq is an empirical percentile-based tail probability surrogate for the sequence-balanced comparison, not a standard two-sample p-value.")
 
     write_text(outdir / "metrics_report.md", "\n".join(lines) + "\n")
 
@@ -1158,19 +1588,24 @@ def run_phase2_from_replicas_csv(
             "permutation_tests": permutation_tests,
             "n_perm": n_perm,
             "seed": seed,
+            "min_set_peptides": min_set_peptides,
+            "min_set_replicas": min_set_replicas,
             "sanity": asdict(sanity_cfg),
         },
         "outputs": {
             "group_summary_csv": str(outdir / "group_summary.csv"),
             "protein_discrimination_csv": str(outdir / "protein_discrimination.csv"),
             "global_rank_by_protein_csv": str(outdir / "global_rank_by_protein.csv"),
+            "set_summary_csv": str(outdir / "set_summary.csv"),
+            "protein_set_discrimination_csv": str(outdir / "protein_set_discrimination.csv"),
+            "protein_set_rank_csv": str(outdir / "protein_set_rank.csv"),
             "metrics_report_md": str(outdir / "metrics_report.md"),
         },
     }
     with run_info_json.open("w", encoding="utf-8") as f:
         json.dump(run_info, f, indent=2, sort_keys=True)
 
-    vlog(1, verbose, "[INFO] Phase 2 outputs written: group_summary.csv, protein_discrimination.csv, global_rank_by_protein.csv, metrics_report.md")
+    vlog(1, verbose, "[INFO] Phase 2 outputs written: group_summary.csv, protein_discrimination.csv, global_rank_by_protein.csv, set_summary.csv, protein_set_discrimination.csv, protein_set_rank.csv, metrics_report.md")
 
 
 STATUS_ORDER = {"PASS": 0, "WARN": 1, "FAIL": 2}
@@ -1198,6 +1633,7 @@ def _count_model_lines_streaming(path: Path) -> int:
 
 def _phase2_checklist_report(
     outdir: Path,
+    exp_root: Path,
     parse_report_json: Path,
     parse_report_txt: Path,
     metrics_report_md: Path,
@@ -1208,6 +1644,8 @@ def _phase2_checklist_report(
     min_replicas: int,
     alpha: float,
     checklist_max_detail: int,
+    min_set_peptides: int,
+    min_set_replicas: int,
     verbose: int = 0,
 ) -> Tuple[str, str]:
     np, pd, _ = _import_phase2_deps()
@@ -1224,16 +1662,20 @@ def _phase2_checklist_report(
 
     group_csv = outdir / "group_summary.csv"
     discr_csv = outdir / "protein_discrimination.csv"
+    set_summary_csv = outdir / "set_summary.csv"
+    set_discr_csv = outdir / "protein_set_discrimination.csv"
     topk_index_csv = outdir / "topk_concat_index.csv"
     topk_parsed_csv = outdir / "topk_parsed.csv"
     replicas_csv = outdir / "replicas_parsed.csv"
 
-    for req in [group_csv, discr_csv, topk_index_csv, topk_parsed_csv, replicas_csv]:
+    for req in [group_csv, discr_csv, set_summary_csv, set_discr_csv, topk_index_csv, topk_parsed_csv, replicas_csv]:
         if not req.exists():
             raise FileNotFoundError(f"Checklist requires {req}")
 
     group = pd.read_csv(group_csv)
     discr = pd.read_csv(discr_csv)
+    set_summary = pd.read_csv(set_summary_csv)
+    set_discr = pd.read_csv(set_discr_csv)
     topk_idx = pd.read_csv(topk_index_csv)
     topk_parsed = pd.read_csv(topk_parsed_csv)
     replicas = pd.read_csv(replicas_csv)
@@ -1297,6 +1739,7 @@ def _phase2_checklist_report(
     details_3 = []
     details_4 = []
     details_5 = []
+    details_6 = []
 
     # 1A
     s1a = "PASS"
@@ -1670,6 +2113,70 @@ def _phase2_checklist_report(
         details_5.append("5B PASS: winner export presence looks consistent for n_used>0 groups.")
     s5 = _combine_status(s5a, s5b)
 
+    s6 = "PASS"
+    fail_6 = []
+    warn_6 = []
+    peptide_to_set = {}
+    if exp_root.exists():
+        _, _, peptide_to_set, _ = _load_peptide_metadata(exp_root, poi_id)
+    nonlegacy = replicas[~replicas["peptide_id"].astype(str).str.endswith(exclude_peptide_suffix)].copy()
+    missing_map = sorted(nonlegacy.loc[~nonlegacy["peptide_id"].astype(str).isin(set(peptide_to_set.keys())), "peptide_id"].dropna().astype(str).unique().tolist())
+    if missing_map:
+        warn_6.append(f"Non-legacy peptides missing peptide_set metadata: {', '.join(missing_map[:checklist_max_detail])}")
+    if not set_discr.empty and not set_summary.empty:
+        set_idx = {(str(r["protein_id"]), str(r["peptide_set"])): r for _, r in set_summary.iterrows()}
+        for _, r in set_discr.iterrows():
+            pid = str(r.get("protein_id", ""))
+            control_set = str(r.get("control_set", ""))
+            key = (pid, control_set)
+            if key not in set_idx and not bool(r.get("flag_skipped", False)):
+                fail_6.append(f"{pid}/{control_set}: missing set_summary row for set-level comparison")
+                continue
+            if key in set_idx:
+                expected = int(_as_float(set_idx[key].get("n_peptides_used", 0)) or 0)
+                observed = int(_as_float(r.get("n_control_peptides", 0)) or 0)
+                # The control set count may exclude the POI peptide if the POI itself
+                # is annotated inside the same peptide_set, so accept either exact
+                # match or expected-1.
+                if observed not in {expected, max(0, expected - 1)}:
+                    fail_6.append(f"{pid}/{control_set}: n_control_peptides={observed} expected={expected} (or {max(0, expected - 1)} if POI is inside the set)")
+            pct = _as_float(r.get("poi_percentile_in_control_seq"))
+            if math.isfinite(pct) and (pct < -eps or pct > 1.0 + eps):
+                fail_6.append(f"{pid}/{control_set}: percentile={pct:.6f} outside [0,1]")
+            p_raw = _as_float(r.get("p_mwu_raw"))
+            q_raw = _as_float(r.get("q_fdr_raw"))
+            if math.isfinite(p_raw) and math.isfinite(q_raw) and q_raw + 1e-9 < p_raw:
+                fail_6.append(f"{pid}/{control_set}: q_fdr_raw={q_raw:.6g} < p_mwu_raw={p_raw:.6g}")
+        for pid, sub in set_discr.groupby("protein_id", sort=True):
+            mask = sub["p_mwu_raw"].notna()
+            if mask.any():
+                expected_q = _bh_fdr(sub.loc[mask, "p_mwu_raw"].astype(float).tolist())
+                observed_q = sub.loc[mask, "q_fdr_raw"].astype(float).tolist()
+                for qo, qe in zip(observed_q, expected_q):
+                    if abs(qo - qe) > 1e-6:
+                        fail_6.append(f"{pid}: raw pooled BH mismatch q_reported={qo:.6g} expected={qe:.6g}")
+                        break
+        matched_present = set_summary[
+            set_summary["peptide_set"].astype(str).str.contains("matched", case=False, na=False)
+            & (pd.to_numeric(set_summary["n_peptides_used"], errors="coerce").fillna(0) >= min_set_peptides)
+        ]
+        for _, row in matched_present.iterrows():
+            pid = str(row["protein_id"])
+            control_set = str(row["peptide_set"])
+            found = not set_discr[(set_discr["protein_id"].astype(str) == pid) & (set_discr["control_set"].astype(str) == control_set)].empty
+            if not found:
+                fail_6.append(f"{pid}/{control_set}: matched-like set missing from protein_set_discrimination")
+    if fail_6:
+        s6 = "FAIL"
+        details_6.append("6 FAIL: set-level analysis integrity checks failed.")
+        details_6.extend([f"- {x}" for x in fail_6[:checklist_max_detail]])
+    elif warn_6:
+        s6 = "WARN"
+        details_6.append("6 WARN: set-level analysis integrity has warnings.")
+        details_6.extend([f"- {x}" for x in warn_6[:checklist_max_detail]])
+    else:
+        details_6.append("6 PASS: set-level mapping, counts, percentiles, and BH q-values look consistent.")
+
     quick_lines = []
     for prot in proteins_with_poi:
         sub = discr[(discr.get("protein_id", "") == prot) & (discr.get("poi_id", "") == poi_id)].copy()
@@ -1706,7 +2213,7 @@ def _phase2_checklist_report(
     replicas_total_used = int(pd.to_numeric(group.get("n_used", 0), errors="coerce").fillna(0).sum())
 
     offender_lines = []
-    if _combine_status(s1, s2, s3, s4, s5) == "FAIL":
+    if _combine_status(s1, s2, s3, s4, s5, s6) == "FAIL":
         offender_lines.append("Top offenders (first N):")
         if s1b == "FAIL" and fail_1b_offenders:
             offender_lines.append("- 1B join inconsistencies:")
@@ -1724,14 +2231,14 @@ def _phase2_checklist_report(
                 offender_lines.append(f"  - {it['protein_id']} row#{it['row']}: p={it['p_mwu']:.3g}, q_reported={it['q_reported']:.3g}, q_expected={it['q_expected']:.3g}")
             offender_lines.append("  Action: recomputar BH por proteína y sobrescribir q_fdr por bloque protein_id.")
 
-    overall = _combine_status(s1, s2, s3, s4, s5)
+    overall = _combine_status(s1, s2, s3, s4, s5, s6)
 
     stdout_lines = [
         f"Script: {SCRIPT_NAME} {SCRIPT_VERSION}",
         "===== Phase 2 Checklist (dockanalrep) =====",
         f"Timestamp: {ts}",
         f"Outdir: {outdir}",
-        f"Config: k={topk_k}, min_replicas={min_replicas}, alpha={alpha}, FDR=BH-per-protein, legacy_suffix=\"{exclude_peptide_suffix}\"",
+        f"Config: k={topk_k}, min_replicas={min_replicas}, min_set_peptides={min_set_peptides}, min_set_replicas={min_set_replicas}, alpha={alpha}, FDR=BH-per-protein, legacy_suffix=\"{exclude_peptide_suffix}\"",
         f"1) Cobertura y coherencia básica: {s1}",
         *[f"   {x}" for x in details_1],
         f"2) Sentido de métricas: {s2}",
@@ -1742,6 +2249,8 @@ def _phase2_checklist_report(
         *[f"   {x}" for x in details_4],
         f"5) Verificación de exports PDB: {s5}",
         *[f"   {x}" for x in details_5],
+        f"6) Set-level analysis integrity: {s6}",
+        *[f"   {x}" for x in details_6],
         f"Coverage: groups_in_group_summary={groups_in_group_summary}, groups_analyzed_nonlegacy={groups_analyzed_nonlegacy}, comparisons_total={comparisons_total}, comparisons_run={comparisons_run}, comparisons_skipped={comparisons_skipped}",
         f"Replicas: total_detected={replicas_total_detected}, total_used={replicas_total_used}, excluded_legacy={excluded_legacy}, excluded_openmm_missing={excluded_openmm_missing}, excluded_other={excluded_other}",
         "Protein summaries (quick):",
@@ -1756,7 +2265,7 @@ def _phase2_checklist_report(
         "## Phase 2 Checklist",
         f"_Run: {ts}_",
         f"(outdir: `{outdir}`)",
-        f"Config: `k={topk_k}, min_replicas={min_replicas}, alpha={alpha}, FDR=BH-per-protein, legacy_suffix=\"{exclude_peptide_suffix}\"`",
+        f"Config: `k={topk_k}, min_replicas={min_replicas}, min_set_peptides={min_set_peptides}, min_set_replicas={min_set_replicas}, alpha={alpha}, FDR=BH-per-protein, legacy_suffix=\"{exclude_peptide_suffix}\"`",
         "",
         f"### 1) Cobertura y coherencia básica — {s1}",
         *details_1,
@@ -1772,6 +2281,9 @@ def _phase2_checklist_report(
         "",
         f"### 5) Verificación de exports PDB — {s5}",
         *details_5,
+        "",
+        f"### 6) Set-level analysis integrity — {s6}",
+        *details_6,
         "",
         f"Coverage: groups_in_group_summary={groups_in_group_summary}, groups_analyzed_nonlegacy={groups_analyzed_nonlegacy}, comparisons_total={comparisons_total}, comparisons_run={comparisons_run}, comparisons_skipped={comparisons_skipped}",
         f"Replicas: total_detected={replicas_total_detected}, total_used={replicas_total_used}, excluded_legacy={excluded_legacy}, excluded_openmm_missing={excluded_openmm_missing}, excluded_other={excluded_other}",
@@ -2239,6 +2751,10 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Exclude peptide IDs ending with this suffix from Phase 2 (default: _old).")
     p.add_argument("--min-replicas", type=int, default=10,
                    help="Minimum n_used per group for unflagged comparisons (default: 10).")
+    p.add_argument("--min-set-peptides", type=int, default=1,
+                   help="Minimum number of control peptides required for unflagged set-level comparisons (default: 1).")
+    p.add_argument("--min-set-replicas", type=int, default=1,
+                   help="Minimum number of pooled control replicas required for unflagged set-level comparisons (default: 1).")
     p.add_argument("--allow-low-n-comparisons", action="store_true",
                    help="Allow POI-vs-control comparisons even when n_used < min-replicas.")
     p.add_argument("--alpha", type=float, default=0.05, help="Alpha for reporting thresholds (default: 0.05).")
@@ -2292,6 +2808,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "poi_id": str(args.poi_id),
                 "exclude_peptide_suffix": str(args.exclude_peptide_suffix),
                 "min_replicas": int(args.min_replicas),
+                "min_set_peptides": int(args.min_set_peptides),
+                "min_set_replicas": int(args.min_set_replicas),
                 "allow_low_n_comparisons": bool(args.allow_low_n_comparisons),
                 "alpha": float(args.alpha),
                 "fdr_method": str(args.fdr_method),
@@ -2335,12 +2853,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         n_perm=int(args.n_perm),
         seed=args.seed,
         exp_root=exp_root,
+        min_set_peptides=int(args.min_set_peptides),
+        min_set_replicas=int(args.min_set_replicas),
         verbose=int(args.verbose),
     )
 
     if args.run_checklist:
         _phase2_checklist_report(
             outdir=outdir,
+            exp_root=exp_root,
             parse_report_json=outdir / "parse_report.json",
             parse_report_txt=outdir / "parse_report.txt",
             metrics_report_md=outdir / "metrics_report.md",
@@ -2349,6 +2870,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             sanity_cfg=sanity_cfg,
             topk_k=int(args.topk),
             min_replicas=int(args.min_replicas),
+            min_set_peptides=int(args.min_set_peptides),
+            min_set_replicas=int(args.min_set_replicas),
             alpha=float(args.alpha),
             checklist_max_detail=max(1, int(args.checklist_max_detail)),
             verbose=int(args.verbose),
