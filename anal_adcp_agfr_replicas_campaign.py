@@ -1215,6 +1215,7 @@ def run_phase2_from_replicas_csv(
         if not poi_candidates:
             continue
         poi_peptide_id = sorted(poi_candidates)[0]
+        poi_set = str(peptide_to_set.get(poi_peptide_id, ""))
         poi_raw = gp_used[gp_used["peptide_id"] == poi_peptide_id][score_col].dropna().astype(float).to_numpy()
         poi_clusters = gp_used[gp_used["peptide_id"] == poi_peptide_id][cluster_col].dropna().astype(float).to_numpy()
         if len(poi_raw) == 0:
@@ -1226,6 +1227,8 @@ def run_phase2_from_replicas_csv(
 
         sets_present = sorted(gp["_peptide_set"].dropna().astype(str).unique().tolist())
         for control_set in sets_present:
+            if poi_set and control_set == poi_set:
+                continue
             control_members = gp_used[(gp_used["_peptide_set"] == control_set) & (gp_used["peptide_id"] != poi_peptide_id)].copy()
             control_peptides = sorted(control_members["peptide_id"].dropna().astype(str).unique().tolist())
             set_info = set_lookup.get((protein_id, control_set), {})
@@ -1983,6 +1986,8 @@ def _phase2_checklist_report(
                 lambda rr: _excluded_reason(rr, score_col, cluster_col, qa_col, exclude_peptide_suffix, sanity_cfg), axis=1
             )
             for (pid, pep), sub in replicas.groupby(["protein_id", "peptide_id"], sort=False):
+                if str(pep).endswith(exclude_peptide_suffix):
+                    continue
                 used_sub = sub[sub["_excluded_reason"] == "used"].copy()
                 replicas_by_group[(pid, pep)] = used_sub
                 exp = int(used_sub["rescored_pdb_path"].astype(str).str.strip().ne("").sum())
@@ -1999,8 +2004,12 @@ def _phase2_checklist_report(
         }
 
     concat_model_count_by_group = {}
+    legacy_index_rows = []
     for _, r in topk_idx.iterrows():
         pid, pep = str(r.get("protein_id", "")), str(r.get("peptide_id", ""))
+        if pep.endswith(exclude_peptide_suffix):
+            legacy_index_rows.append(f"{pid}/{pep}")
+            continue
         g = group_idx.get((pid, pep))
         if g is None:
             fail_5a.append(f"{pid}/{pep}: missing group_summary row for topk index")
@@ -2056,6 +2065,8 @@ def _phase2_checklist_report(
     concat_topk_crosscheck_warnings = []
     for _, r in topk_idx.iterrows():
         pid, pep = str(r.get("protein_id", "")), str(r.get("peptide_id", ""))
+        if pep.endswith(exclude_peptide_suffix):
+            continue
         observed_models_topk = int(topk_group_counts.get((pid, pep), 0))
         observed_models_concat = concat_model_count_by_group.get((pid, pep))
         if observed_models_concat is None:
@@ -2067,6 +2078,9 @@ def _phase2_checklist_report(
             warn_5a.append(msg)
             concat_topk_crosscheck_warnings.append(msg)
 
+    if legacy_index_rows:
+        details_5.append("5A WARN: Legacy export files detected from prior runs; ignored in current-run validation.")
+        details_5.extend([f"- ignored legacy concat index row: {x}" for x in legacy_index_rows[:checklist_max_detail]])
     if not concat_topk_crosscheck_warnings:
         details_5.append("5A PASS: concat MODEL counts match topk_parsed row counts for all concat groups.")
     if fail_5a:
@@ -2089,6 +2103,8 @@ def _phase2_checklist_report(
     warn_5b, fail_5b = [], []
     for _, g in group.iterrows():
         pid, pep = str(g["protein_id"]), str(g["peptide_id"])
+        if pep.endswith(exclude_peptide_suffix):
+            continue
         n_used = int(_as_float(g.get("n_used", 0)) or 0)
         if n_used <= 0:
             continue
@@ -2123,11 +2139,21 @@ def _phase2_checklist_report(
     missing_map = sorted(nonlegacy.loc[~nonlegacy["peptide_id"].astype(str).isin(set(peptide_to_set.keys())), "peptide_id"].dropna().astype(str).unique().tolist())
     if missing_map:
         warn_6.append(f"Non-legacy peptides missing peptide_set metadata: {', '.join(missing_map[:checklist_max_detail])}")
+    self_comparison_found = False
     if not set_discr.empty and not set_summary.empty:
         set_idx = {(str(r["protein_id"]), str(r["peptide_set"])): r for _, r in set_summary.iterrows()}
+        poi_set_by_protein = {}
+        poi_rows = set_summary[set_summary["peptide_set"].astype(str).str.casefold() == str(poi_id).casefold()].copy()
+        for _, poi_row in poi_rows.iterrows():
+            poi_set_by_protein[str(poi_row["protein_id"])] = str(poi_row["peptide_set"])
         for _, r in set_discr.iterrows():
             pid = str(r.get("protein_id", ""))
             control_set = str(r.get("control_set", ""))
+            poi_set = poi_set_by_protein.get(pid, "")
+            if poi_set and control_set == poi_set:
+                self_comparison_found = True
+                fail_6.append(f"{pid}/{control_set}: self-comparison row should not be present in protein_set_discrimination")
+                continue
             key = (pid, control_set)
             if key not in set_idx and not bool(r.get("flag_skipped", False)):
                 fail_6.append(f"{pid}/{control_set}: missing set_summary row for set-level comparison")
@@ -2171,11 +2197,14 @@ def _phase2_checklist_report(
         details_6.append("6 FAIL: set-level analysis integrity checks failed.")
         details_6.extend([f"- {x}" for x in fail_6[:checklist_max_detail]])
     elif warn_6:
+        if not self_comparison_found:
+            details_6.append("6 PASS note: self-comparisons correctly excluded from set-level discrimination.")
         s6 = "WARN"
         details_6.append("6 WARN: set-level analysis integrity has warnings.")
         details_6.extend([f"- {x}" for x in warn_6[:checklist_max_detail]])
     else:
         details_6.append("6 PASS: set-level mapping, counts, percentiles, and BH q-values look consistent.")
+        details_6.append("6 PASS note: self-comparisons correctly excluded from set-level discrimination.")
 
     quick_lines = []
     for prot in proteins_with_poi:
@@ -2628,6 +2657,8 @@ def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_
     concat_index_rows: List[Dict[str, object]] = []
     for gk, blocks in group_to_concat_blocks.items():
         exp_id, protein_id, peptide_id = gk
+        if peptide_id.endswith(exclude_peptide_suffix):
+            continue
         # renumber models from 1..N
         concat_text = renumber_models(blocks, start_at=1)
         out_path = concat_dir / protein_id / peptide_id / f"topk_concat_{protein_id}_{peptide_id}.pdb"
