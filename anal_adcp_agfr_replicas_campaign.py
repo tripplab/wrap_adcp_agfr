@@ -2343,7 +2343,7 @@ def _phase2_checklist_report(
 # Pipeline principal: parseo + consolidación + export PDB + QA
 # ----------------------------
 
-def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_cfg: SanityConfig, verbose: int = 0) -> None:
+def run_parse_and_consolidate(exp_root: Path, outdir: Path, topk_k: int, sanity_cfg: SanityConfig, exclude_peptide_suffix: str, verbose: int = 0) -> None:
     safe_mkdir(outdir)
     vlog(1, verbose, f"[INFO] Discovering replicas under: {exp_root / 'runs'}")
 
@@ -2863,7 +2863,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     with (outdir / "run_info.json").open("w", encoding="utf-8") as f:
         json.dump(run_info, f, indent=2, sort_keys=True)
 
-    run_parse_and_consolidate(exp_root, outdir, topk_k=int(args.topk), sanity_cfg=sanity_cfg, verbose=int(args.verbose))
+    run_parse_and_consolidate(
+        exp_root,
+        outdir,
+        topk_k=int(args.topk),
+        sanity_cfg=sanity_cfg,
+        exclude_peptide_suffix=str(args.exclude_peptide_suffix),
+        verbose=int(args.verbose),
+    )
     if args.verbose:
         eprint(f"[INFO] Completed parse+consolidation for {exp_root} -> {outdir}")
 
