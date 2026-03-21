@@ -2206,27 +2206,117 @@ def _phase2_checklist_report(
         details_6.append("6 PASS: set-level mapping, counts, percentiles, and BH q-values look consistent.")
         details_6.append("6 PASS note: self-comparisons correctly excluded from set-level discrimination.")
 
+    def _quick_control_label(name: object) -> str:
+        ctrl = str(name or "?")
+        lname = ctrl.lower()
+        if "matched" in lname:
+            return "matched"
+        if "decoy" in lname:
+            return "decoy"
+        if "polya" in lname:
+            return "polya"
+        return ctrl
+
+    def _fmt_set_quick_chunk(rr) -> str:
+        ctrl = _quick_control_label(rr.get("control_set", "?"))
+        pct = _as_float(rr.get("poi_percentile_in_control_seq"))
+        p_emp = _as_float(rr.get("p_empirical_seq"))
+        auc_raw = _as_float(rr.get("auc_raw"))
+        q_raw = _as_float(rr.get("q_fdr_raw"))
+        d1_seq = _as_float(rr.get("delta_f1_seq"))
+        parts = [f"POI vs {ctrl}"]
+        if math.isfinite(pct):
+            parts.append(f"percentile={pct:.3f}")
+        if math.isfinite(p_emp):
+            parts.append(f"p_emp={p_emp:.3g}")
+        if math.isfinite(auc_raw):
+            parts.append(f"AUC_raw={auc_raw:.3f}")
+        if math.isfinite(q_raw):
+            parts.append(f"q_raw={q_raw:.3g}")
+        if math.isfinite(d1_seq):
+            parts.append(f"delta_f1_seq={d1_seq:+.2f}")
+        return " ".join([parts[0], *parts[1:]])
+
+    def _fmt_individual_quick_chunk(rr) -> str:
+        ctrl = _quick_control_label(rr.get("control_id", "?"))
+        auc = _as_float(rr.get("auc"))
+        qv = _as_float(rr.get("q_fdr"))
+        d1 = _as_float(rr.get("delta_f1"))
+        parts = [f"POI vs {ctrl}"]
+        if math.isfinite(auc):
+            parts.append(f"AUC={auc:.3f}")
+        if math.isfinite(qv):
+            parts.append(f"q={qv:.3g}")
+        if math.isfinite(d1):
+            parts.append(f"delta_f1={d1:+.2f}")
+        return " ".join([parts[0], *parts[1:]])
+
     quick_lines = []
     for prot in proteins_with_poi:
-        sub = discr[(discr.get("protein_id", "") == prot) & (discr.get("poi_id", "") == poi_id)].copy()
-        if sub.empty:
+        set_sub = set_discr[(set_discr.get("protein_id", "") == prot) & (set_discr.get("poi_id", "") == poi_id)].copy()
+        if not set_sub.empty:
+            set_sub = set_sub[~set_sub.get("flag_skipped", False).fillna(False).astype(bool)].copy()
+        indiv_sub = discr[(discr.get("protein_id", "") == prot) & (discr.get("poi_id", "") == poi_id)].copy()
+        if not indiv_sub.empty:
+            indiv_sub = indiv_sub[~indiv_sub.get("flag_skipped", False).fillna(False).astype(bool)].copy()
+
+        if set_sub.empty and indiv_sub.empty:
             continue
-        sub["q_fdr_sort"] = pd.to_numeric(sub.get("q_fdr"), errors="coerce").fillna(float("inf"))
-        sub["_priority"] = 2
-        sub.loc[sub["control_id"].astype(str).str.contains("decoy", case=False, na=False), "_priority"] = 0
-        sub.loc[sub["control_id"].astype(str).str.lower() == "polya", "_priority"] = 1
-        sub = sub.sort_values(["_priority", "q_fdr_sort", "control_id"], kind="stable")
+
+        if not set_sub.empty:
+            set_sub["control_set"] = set_sub["control_set"].astype(str)
+            set_sub["p_empirical_seq_sort"] = pd.to_numeric(set_sub.get("p_empirical_seq"), errors="coerce").fillna(float("inf"))
+            set_sub["q_fdr_raw_sort"] = pd.to_numeric(set_sub.get("q_fdr_raw"), errors="coerce").fillna(float("inf"))
+            set_sub["percentile_sort"] = pd.to_numeric(set_sub.get("poi_percentile_in_control_seq"), errors="coerce").fillna(-1.0)
+            set_sub["_priority"] = set_sub["control_set"].map(lambda s: _control_set_priority(str(s))[0])
+            set_sub = set_sub.sort_values(["_priority", "p_empirical_seq_sort", "q_fdr_raw_sort", "percentile_sort", "control_set"], ascending=[True, True, True, False, True], kind="stable")
+
+        if not indiv_sub.empty:
+            indiv_sub["control_id"] = indiv_sub["control_id"].astype(str)
+            indiv_sub["q_fdr_sort"] = pd.to_numeric(indiv_sub.get("q_fdr"), errors="coerce").fillna(float("inf"))
+            indiv_sub["auc_sort"] = pd.to_numeric(indiv_sub.get("auc"), errors="coerce").fillna(-1.0)
+            indiv_sub = indiv_sub.sort_values(["q_fdr_sort", "auc_sort", "control_id"], ascending=[True, False, True], kind="stable")
+
         chunks = []
-        for _, rr in sub.head(5).iterrows():
-            ctrl = str(rr.get("control_id", "?"))
-            skipped = bool(rr.get("flag_skipped", False))
-            if skipped:
-                chunks.append(f"POI vs {ctrl} SKIPPED(low-n)")
-            else:
-                auc = _as_float(rr.get("auc"))
-                qv = _as_float(rr.get("q_fdr"))
-                d1 = _as_float(rr.get("delta_f1"))
-                chunks.append(f"POI vs {ctrl} AUC={auc:.3f} q={qv:.3g} delta_f1={d1:+.2f}")
+        used_set_controls = set()
+
+        def _first_set_match(pred):
+            if set_sub.empty:
+                return None
+            matched = set_sub[set_sub["control_set"].map(pred)]
+            if matched.empty:
+                return None
+            rr = matched.iloc[0]
+            used_set_controls.add(str(rr["control_set"]))
+            return _fmt_set_quick_chunk(rr)
+
+        def _first_individual_match(pred):
+            if indiv_sub.empty:
+                return None
+            matched = indiv_sub[indiv_sub["control_id"].map(pred)]
+            if matched.empty:
+                return None
+            return _fmt_individual_quick_chunk(matched.iloc[0])
+
+        primary_specs = [
+            (lambda s: "matched" in s.lower(), None),
+            (lambda s: "decoy" in s.lower(), lambda s: "decoy" in s.lower()),
+            (lambda s: "polya" in s.lower(), lambda s: s.lower() == "polya"),
+        ]
+        for set_pred, indiv_pred in primary_specs:
+            chunk = _first_set_match(set_pred)
+            if chunk is None and indiv_pred is not None:
+                chunk = _first_individual_match(indiv_pred)
+            if chunk is not None:
+                chunks.append(chunk)
+
+        if not set_sub.empty:
+            for _, rr in set_sub.iterrows():
+                ctrl = str(rr.get("control_set", ""))
+                if ctrl in used_set_controls:
+                    continue
+                chunks.append(_fmt_set_quick_chunk(rr))
+
         if chunks:
             quick_lines.append(f"{prot}: " + "; ".join(chunks))
 
