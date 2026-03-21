@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Tuple, Iterable
 
 
 SCRIPT_NAME = "anal_adcp_agfr_replicas_campaign.py"
-SCRIPT_VERSION = "v2"
+SCRIPT_VERSION = "v2.5"
 
 
 
@@ -728,7 +728,7 @@ SET_SUMMARY_FIELDS = [
 ]
 
 PROTEIN_SET_DISCRIMINATION_FIELDS = [
-    "protein_id", "poi_id", "control_set",
+    "protein_id", "poi_id", "control_set", "primary_seq_test",
     "n_poi_replicas", "n_control_peptides", "n_control_replicas_total",
     "poi_Eint_seq_summary", "control_Eint_seq_median", "control_Eint_seq_IQR", "delta_seq_median",
     "poi_rank_among_control_seq", "poi_percentile_in_control_seq", "auc_seq", "p_empirical_seq",
@@ -1236,10 +1236,12 @@ def run_phase2_from_replicas_csv(
                 (len(control_peptides) < min_set_peptides) or (len(control_members) < min_set_replicas)
             )
             skipped = bool(len(control_peptides) == 0 or len(control_members) == 0)
+            primary_seq_test = "singleton_control" if len(control_peptides) == 1 else "sequence_balanced"
             base = {
                 "protein_id": protein_id,
                 "poi_id": poi_peptide_id,
                 "control_set": control_set,
+                "primary_seq_test": primary_seq_test,
                 "n_poi_replicas": int(len(poi_raw)),
                 "n_control_peptides": int(len(control_peptides)),
                 "n_control_replicas_total": int(len(control_members)),
@@ -1528,7 +1530,8 @@ def run_phase2_from_replicas_csv(
     lines.append("")
     lines.append("## Set-level analysis")
     lines.append("")
-    lines.append("Primary set-level analysis is sequence-balanced: each control peptide contributes one median winner_omm_dE_interaction value, which prevents large pooled control sets from dominating by raw replica count alone.")
+    lines.append("Primary set-level analysis is sequence-balanced when the control set has multiple peptides: each control peptide contributes one median winner_omm_dE_interaction value, which prevents large pooled control sets from dominating by raw replica count alone.")
+    lines.append("Singleton control sets are labeled `singleton_control` to make clear that the primary sequence-balanced test is singleton-limited; in those cases, the secondary raw-pooled metrics (`AUC_raw`, `q_raw`) should carry more interpretive weight.")
     lines.append("Secondary set-level analysis pools raw replicas across the control set for a higher-power but potentially control-heavy sensitivity view.")
     for protein_id in sorted(set_discr_df["protein_id"].dropna().astype(str).unique().tolist()) if not set_discr_df.empty else []:
         lines.append("")
@@ -1536,11 +1539,11 @@ def run_phase2_from_replicas_csv(
         sub = set_discr_df[set_discr_df["protein_id"] == protein_id].copy()
         sub["_priority"] = sub["control_set"].map(lambda s: _control_set_priority(str(s))[0])
         sub = sub.sort_values(["_priority", "p_empirical_seq", "q_fdr_raw"], ascending=[True, True, True])
-        lines.append("| control_set | n_control_peptides | n_control_replicas_total | poi_Eint_seq_summary | control_Eint_seq_median | control_Eint_seq_IQR | poi_percentile_in_control_seq | p_empirical_seq | delta_f1_seq | auc_raw | q_fdr_raw | delta_f1_rawpool | skipped |")
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("| control_set | primary_seq_test | n_control_peptides | n_control_replicas_total | poi_Eint_seq_summary | control_Eint_seq_median | control_Eint_seq_IQR | poi_percentile_in_control_seq | p_empirical_seq | delta_f1_seq | auc_raw | q_fdr_raw | delta_f1_rawpool | skipped |")
+        lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for _, r in sub.iterrows():
             lines.append(
-                f"| {r['control_set']} | {int(r['n_control_peptides'])} | {int(r['n_control_replicas_total'])} | {r['poi_Eint_seq_summary']:.3f} | {r['control_Eint_seq_median']:.3f} | {r['control_Eint_seq_IQR']:.3f} | {r['poi_percentile_in_control_seq']:.3f} | {r['p_empirical_seq']:.3g} | {r['delta_f1_seq']:.3f} | {r['auc_raw']:.3f} | {r['q_fdr_raw']:.3g} | {r['delta_f1_rawpool']:.3f} | {bool(r['flag_skipped'])} |"
+                f"| {r['control_set']} | {r['primary_seq_test']} | {int(r['n_control_peptides'])} | {int(r['n_control_replicas_total'])} | {r['poi_Eint_seq_summary']:.3f} | {r['control_Eint_seq_median']:.3f} | {r['control_Eint_seq_IQR']:.3f} | {r['poi_percentile_in_control_seq']:.3f} | {r['p_empirical_seq']:.3g} | {r['delta_f1_seq']:.3f} | {r['auc_raw']:.3f} | {r['q_fdr_raw']:.3g} | {r['delta_f1_rawpool']:.3f} | {bool(r['flag_skipped'])} |"
             )
         rv = set_rank_df[set_rank_df["protein_id"] == protein_id]
         if not rv.empty:
@@ -2219,16 +2222,25 @@ def _phase2_checklist_report(
 
     def _fmt_set_quick_chunk(rr) -> str:
         ctrl = _quick_control_label(rr.get("control_set", "?"))
+        primary_seq_test = str(rr.get("primary_seq_test", "") or "sequence_balanced")
+        n_ctrl_peptides = _as_float(rr.get("n_control_peptides"))
+        n_ctrl_reps = _as_float(rr.get("n_control_replicas_total"))
         pct = _as_float(rr.get("poi_percentile_in_control_seq"))
         p_emp = _as_float(rr.get("p_empirical_seq"))
         auc_raw = _as_float(rr.get("auc_raw"))
         q_raw = _as_float(rr.get("q_fdr_raw"))
         d1_seq = _as_float(rr.get("delta_f1_seq"))
-        parts = [f"POI vs {ctrl}"]
-        if math.isfinite(pct):
-            parts.append(f"percentile={pct:.3f}")
-        if math.isfinite(p_emp):
-            parts.append(f"p_emp={p_emp:.3g}")
+        label_bits = [primary_seq_test]
+        if math.isfinite(n_ctrl_peptides):
+            label_bits.append(f"n_ctrl_peptides={int(n_ctrl_peptides)}")
+        if math.isfinite(n_ctrl_reps):
+            label_bits.append(f"n_ctrl_reps={int(n_ctrl_reps)}")
+        parts = [f"POI vs {ctrl} [{'; '.join(label_bits)}]"]
+        if primary_seq_test != "singleton_control":
+            if math.isfinite(pct):
+                parts.append(f"percentile={pct:.3f}")
+            if math.isfinite(p_emp):
+                parts.append(f"p_emp={p_emp:.3g}")
         if math.isfinite(auc_raw):
             parts.append(f"AUC_raw={auc_raw:.3f}")
         if math.isfinite(q_raw):
